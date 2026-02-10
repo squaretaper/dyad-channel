@@ -45,6 +45,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       name: account.name,
       enabled: account.enabled,
       configured: account.configured,
+      token: account.config.token ?? "",
       tokenSource: account.config.token ? "config" : "none",
     }),
   },
