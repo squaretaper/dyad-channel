@@ -50,15 +50,17 @@ export interface ResolvedDyadAccount {
 const DEFAULT_ACCOUNT_ID = "default";
 
 /**
- * List all configured Dyad account IDs
+ * List all configured Dyad account IDs.
+ * Always returns default account — isConfigured handles the actual check.
  */
 export function listDyadAccountIds(cfg: OpenClawConfig): string[] {
   const dyadCfg = (cfg.channels as Record<string, unknown> | undefined)?.dyad as
     | DyadAccountConfig
     | undefined;
 
-  // If token is configured at top level, we have a default account
-  if (dyadCfg?.token) {
+  // Always return default account if dyad config section exists
+  // isConfigured will determine if the token is valid
+  if (dyadCfg) {
     return [DEFAULT_ACCOUNT_ID];
   }
 

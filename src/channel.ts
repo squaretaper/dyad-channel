@@ -45,8 +45,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       name: account.name,
       enabled: account.enabled,
       configured: account.configured,
-      workspaceId: account.workspaceId,
-      botId: account.botId,
+      tokenSource: account.config.token ? "config" : "none",
     }),
   },
 
@@ -127,6 +126,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       enabled: account.enabled,
       configured: account.configured,
       running: runtime?.running ?? false,
+      tokenSource: account.config.token ? "config" : "none",
       lastStartAt: runtime?.lastStartAt ?? null,
       lastStopAt: runtime?.lastStopAt ?? null,
       lastError: runtime?.lastError ?? null,

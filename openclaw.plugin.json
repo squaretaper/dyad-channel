@@ -5,6 +5,23 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Whether this Dyad channel account is enabled"
+      },
+      "name": {
+        "type": "string",
+        "description": "Display name for this account"
+      },
+      "token": {
+        "type": "string",
+        "description": "Base64-encoded bot token containing Supabase credentials and workspace identity"
+      },
+      "dmPolicy": {
+        "type": "string",
+        "enum": ["open", "disabled"],
+        "description": "DM access policy (default: open, workspace membership handles access)"
+      },
       "coordChatId": {
         "type": "string",
         "description": "UUID of the #coordination chat for inter-agent negotiation"

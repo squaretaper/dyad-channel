@@ -10,10 +10,18 @@ OpenClaw channel plugin for [Dyad](https://dyadai.com) AI workspaces. Chat with 
 openclaw extension install github:squaretaper/dyad-channel
 ```
 
-Or manually:
+Or manually — clone directly into the extensions directory:
 ```bash
 git clone https://github.com/squaretaper/dyad-channel.git ~/.openclaw/extensions/dyad
 ```
+
+> **Note:** Do not use a symlink — the global extensions scanner uses `readdirSync` with `withFileTypes`, which sees symlinks as symlinks (not directories) and skips them. If you're developing locally, add the path to your `openclaw.yaml` instead:
+> ```yaml
+> plugins:
+>   load:
+>     paths:
+>       - /absolute/path/to/dyad-channel
+> ```
 
 ### 2. Get a bot token from Dyad
 
