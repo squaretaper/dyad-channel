@@ -1,0 +1,34 @@
+{
+  "id": "dyad",
+  "channels": ["dyad"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "coordChatId": {
+        "type": "string",
+        "description": "UUID of the #coordination chat for inter-agent negotiation"
+      },
+      "apiUrl": {
+        "type": "string",
+        "description": "Dyad API URL for posting coordination messages (e.g. https://dyadai.vercel.app)"
+      },
+      "botToken": {
+        "type": "string",
+        "description": "Hex API token for bot authentication with the Dyad API"
+      },
+      "botName": {
+        "type": "string",
+        "description": "Bot display name used as speaker identity in coordination"
+      },
+      "gatewayUrl": {
+        "type": "string",
+        "description": "OpenClaw gateway URL for LLM calls (e.g. http://localhost:18789)"
+      },
+      "gatewayToken": {
+        "type": "string",
+        "description": "OpenClaw gateway bearer token"
+      }
+    }
+  }
+}

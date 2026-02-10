@@ -1,0 +1,37 @@
+{
+  "name": "@dyad/openclaw-channel",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for Dyad AI workspaces",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "zod": "^4.3.6"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.0"
+  },
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "typescript": "^5.7.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "dyad",
+      "label": "Dyad",
+      "selectionLabel": "Dyad (AI Workspace)",
+      "docsPath": "/channels/dyad",
+      "docsLabel": "dyad",
+      "blurb": "Connect your agent to Dyad collaborative AI workspaces.",
+      "order": 90,
+      "quickstartAllowFrom": false
+    },
+    "install": {
+      "npmSpec": "@dyad/openclaw-channel",
+      "localPath": "extensions/dyad",
+      "defaultChoice": "npm"
+    }
+  }
+}
