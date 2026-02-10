@@ -4,6 +4,7 @@
   "description": "OpenClaw channel plugin for Dyad AI workspaces",
   "type": "module",
   "dependencies": {
+    "@supabase/functions-js": "^2.95.3",
     "@supabase/supabase-js": "^2.49.0",
     "zod": "^4.3.6"
   },
@@ -11,7 +12,6 @@
     "openclaw": ">=2026.1.0"
   },
   "devDependencies": {
-    "openclaw": "workspace:*",
     "typescript": "^5.7.0"
   },
   "openclaw": {
