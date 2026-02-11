@@ -177,7 +177,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         prompt: string,
         timeoutMs: number,
         retries: number = 1,
-        sessionHint?: string,
       ): Promise<string | null> {
         for (let attempt = 0; attempt <= retries; attempt++) {
           // Concurrency guard — wait if at capacity
@@ -187,12 +186,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           activeGatewayCalls++;
           try {
             const thisTimeout = attempt === 0 ? timeoutMs : timeoutMs * 2;
-            // Use hint-based stable session IDs to reuse gateway sessions within
-            // a coordination round, preventing unbounded session creation.
-            // Hints: "round:<id>" for Layer 1, "dialogue"/"misc" for Layer 2.
-            const sessionId = sessionHint
-              ? `dyad:coord:${sessionHint}`
-              : `dyad:coord:misc:${Date.now()}`;
+            // Single stable session per bot — matches the old sidecar approach.
+            // All coordination calls share one session so the bot accumulates
+            // context across rounds. Depth cap (MAX_COORDINATION_DEPTH) bounds
+            // the conversation, not session isolation.
+            const sessionId = `dyad:coord`;
             const res = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
@@ -384,7 +382,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       if (coordEnabled) {
         coordination = createCoordinationHandler({
           botName: account.botName,
-          callGateway: (prompt, timeoutMs, sessionHint) => callGateway(prompt, timeoutMs, 1, sessionHint),
+          callGateway: (prompt, timeoutMs) => callGateway(prompt, timeoutMs),
           // Post to coordination via API route (same pattern as the sidecar).
           // The API route uses service role client → bypasses RLS.
           // Direct Supabase inserts require bot auth + RLS and fail silently.
