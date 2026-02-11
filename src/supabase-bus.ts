@@ -40,6 +40,8 @@ export interface DyadBusOptions {
   botEmail?: string;
   /** Bot password for Supabase auth sign-in */
   botPassword?: string;
+  /** Bot display name (used as speaker in messages) */
+  botDisplayName?: string;
   /** Called when a new message arrives for the bot */
   onMessage: (msg: {
     chatId: string;
@@ -109,6 +111,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     botUserId,
     botEmail,
     botPassword,
+    botDisplayName,
     onMessage,
     onError,
     onConnect,
@@ -131,13 +134,18 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
   // Sign in as the bot user so Realtime subscriptions pass RLS
   if (botEmail && botPassword) {
-    const { error: signInError } = await supabase.auth.signInWithPassword({
+    console.log(`[dyad-bus] Attempting sign-in for ${botEmail}`);
+    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
       email: botEmail,
       password: botPassword,
     });
     if (signInError) {
       onError(new Error(`Bot sign-in failed: ${signInError.message}`), "auth");
+    } else {
+      console.log(`[dyad-bus] Sign-in OK, user: ${signInData.user?.id}`);
     }
+  } else {
+    console.log(`[dyad-bus] No botEmail/botPassword — skipping sign-in (email=${!!botEmail}, pwd=${!!botPassword})`);
   }
 
   // Subscription health tracking
@@ -330,7 +338,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       const { error } = await supabase.from("messages").insert({
         chat_id: chatId,
         user_id: botUserId,
-        speaker: "assistant",
+        speaker: botDisplayName || "Bot",
         content,
         message_type: "bot_response",
       });

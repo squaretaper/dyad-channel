@@ -5,7 +5,6 @@ import {
 } from "openclaw/plugin-sdk";
 import { DyadConfigSchema } from "./config-schema.js";
 import { startDyadBus, type DyadBusHandle } from "./supabase-bus.js";
-import { getDyadRuntime } from "./runtime.js";
 import {
   listDyadAccountIds,
   resolveDefaultDyadAccountId,
@@ -154,8 +153,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         throw new Error("Dyad bot token not configured or invalid");
       }
 
-      const runtime = getDyadRuntime();
-
       // --- Gateway caller for coordination LLM calls ---
       const coordEnabled = Boolean(
         account.coordChatId && account.apiBotToken && account.gatewayToken,
@@ -213,29 +210,61 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         botUserId: account.botUserId,
         botEmail: account.botEmail,
         botPassword: account.botPassword,
+        botDisplayName: account.botName,
         onMessage: async ({ chatId, text, userId }) => {
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
-          const chatType = "direct" as const;
+          try {
+            // Fetch recent conversation history for context
+            const { data: recentMessages } = await bus.client
+              .from("messages")
+              .select("speaker, content, message_type")
+              .eq("chat_id", chatId)
+              .order("created_at", { ascending: false })
+              .limit(20);
 
-          // Use the runtime's reply pipeline to process inbound messages.
-          // The handleInboundMessage method is provided by the runtime at startup
-          // but not exposed in the static PluginRuntime type — access via cast.
-          const replyRuntime = runtime.channel.reply as Record<string, unknown>;
-          if (typeof replyRuntime.handleInboundMessage === "function") {
-            await (replyRuntime.handleInboundMessage as (opts: unknown) => Promise<void>)({
-              channel: "dyad",
-              accountId: account.accountId,
-              senderId: userId,
-              chatType,
-              chatId,
-              text,
-              reply: async (responseText: string) => {
-                await bus.sendMessage(chatId, responseText);
+            // Build messages array for gateway (chronological order)
+            const history = (recentMessages || []).reverse().map((msg: any) => ({
+              role: msg.message_type === "claude_response" || msg.message_type === "bot_response"
+                ? "assistant" as const
+                : "user" as const,
+              content: msg.message_type === "claude_response" || msg.message_type === "bot_response"
+                ? msg.content
+                : `${msg.speaker}: ${msg.content}`,
+            }));
+
+            // Call OpenClaw gateway for LLM response
+            const gatewayRes = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(account.gatewayToken ? { Authorization: `Bearer ${account.gatewayToken}` } : {}),
               },
+              body: JSON.stringify({
+                model: "openclaw:main",
+                user: `dyad:${chatId}`,
+                messages: history,
+              }),
+              signal: AbortSignal.timeout(120_000),
             });
-          } else {
-            ctx.log?.warn(`${tag} handleInboundMessage not available — message may not be processed`);
+
+            if (!gatewayRes.ok) {
+              const errText = await gatewayRes.text().catch(() => "unknown");
+              ctx.log?.error(`${tag} Gateway error ${gatewayRes.status}: ${errText.slice(0, 200)}`);
+              return;
+            }
+
+            const result = await gatewayRes.json();
+            const responseText = result?.choices?.[0]?.message?.content?.trim();
+
+            if (responseText) {
+              await bus.sendMessage(chatId, responseText);
+              ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${responseText.length} chars)`);
+            } else {
+              ctx.log?.warn(`${tag} Gateway returned empty response`);
+            }
+          } catch (err: any) {
+            ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
           }
         },
         onError: (error, context) => {
