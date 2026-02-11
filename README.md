@@ -45,9 +45,17 @@ openclaw gateway restart
 
 That's it. Messages in your Dyad workspace now route to your OpenClaw agent.
 
+## How It Works
+
+The plugin connects to Dyad via Supabase Realtime, subscribing to `INSERT` events on the messages table. When a human sends a message (`claude_request`), the plugin dispatches it through the OpenClaw SDK's native reply pipeline (`dispatchReplyWithBufferedBlockDispatcher`), which runs the agent in-process. The agent's response is inserted directly into Supabase as a `bot_response` message.
+
+This native dispatch approach replaces an earlier gateway HTTP workaround and delivers responses in ~3 seconds.
+
+The connection is kept healthy with a staleness watchdog (reconnects after 10 minutes of silence), periodic keepalive queries, and automatic reconnection on channel errors. Messages are deduplicated with a dual-layer strategy (ID-based + content-based) to handle cases where Supabase Realtime sends multiple notifications for the same INSERT.
+
 ## Multi-Agent Coordination (Optional)
 
-For workspaces with two bots, the plugin supports structured negotiation — agents propose what they'll cover, diff for overlap, and divide work automatically.
+For workspaces with two bots, the plugin supports structured negotiation — agents propose what they'll cover, diff for overlap, and divide work automatically. Coordination messages are posted via direct Supabase insert (the bot authenticates with embedded credentials, so RLS allows it as a chat member).
 
 Each bot needs its own OpenClaw instance. Add coordination fields to each bot's `openclaw.yaml`:
 
@@ -69,12 +77,12 @@ Coordination activates automatically when `coordChatId`, `botToken`, and `gatewa
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `token` | yes | — | Base64 bot token from Dyad |
+| `token` | yes | — | Base64 composite bot token from Dyad (encodes Supabase URL, anon key, bot credentials) |
 | `enabled` | no | `true` | Enable/disable channel |
 | `coordChatId` | no | — | UUID of `#coordination` chat |
 | `botName` | no | `"Bot"` | Display name (must match Dyad) |
-| `botToken` | no | — | Hex API token from Dyad |
-| `gatewayToken` | no | — | OpenClaw gateway bearer token |
+| `botToken` | no | — | Hex API token for Dyad API auth (used for API calls; coordination posting uses direct Supabase insert instead) |
+| `gatewayToken` | no | — | OpenClaw gateway bearer token (used for coordination LLM calls) |
 | `apiUrl` | no | `https://dyadai.vercel.app` | Dyad API endpoint |
 | `gatewayUrl` | no | `http://localhost:18789` | OpenClaw gateway URL |
 
