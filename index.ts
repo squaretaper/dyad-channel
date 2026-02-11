@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { dyadPlugin } from "./src/channel.js";
 import { setDyadRuntime } from "./src/runtime.js";
+import { createCoordSendTool, createCoordHistoryTool } from "./src/tools.js";
 
 // OpenClawPluginDefinition — typed inline to avoid import path issues with symlinked modules
 const plugin: {
@@ -18,6 +19,10 @@ const plugin: {
   register(api: OpenClawPluginApi) {
     setDyadRuntime(api.runtime);
     api.registerChannel({ plugin: dyadPlugin });
+
+    // Agent tools for inter-agent dialogue via #coordination channel
+    api.registerTool(createCoordSendTool(), { optional: true });
+    api.registerTool(createCoordHistoryTool(), { optional: true });
   },
 };
 

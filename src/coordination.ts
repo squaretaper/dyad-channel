@@ -538,8 +538,8 @@ Choose ONE:
       parsed?.kind &&
       ["question", "inform", "delegate", "status", "flag"].includes(parsed.kind)
     ) {
-      if (hasActiveRound()) {
-        log.info(`AgentMessage from ${speaker} deferred — active round in progress`);
+      if (hasActiveRound() && parsed.to !== botName) {
+        log.info(`AgentMessage from ${speaker} deferred — active round + not directed to us`);
         return;
       }
 
