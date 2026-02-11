@@ -153,8 +153,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   let messageChannel: RealtimeChannel | null = null;
   let coordChannel: RealtimeChannel | null = null;
 
-  // Dedup for coordination messages
+  // Dedup for messages — dual-layer: ID-based + content-based
+  // ID-based catches exact row re-delivery. Content-based catches cases where
+  // Supabase sends different notification IDs for the same INSERT (observed: 5x in 2ms).
   const seenMessageIds = new Set<string>();
+  const seenContentKeys = new Set<string>();
   const seenCoordIds = new Set<string>();
 
   // Interval handles for cleanup
@@ -190,13 +193,22 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
 
-            // Dedup — Realtime can deliver the same INSERT multiple times
+            // Dedup layer 1: ID-based (exact row re-delivery)
             if (seenMessageIds.has(msg.id)) {
-              onError(new Error(`Dedup: skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+              onError(new Error(`Dedup(id): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
               return;
             }
             seenMessageIds.add(msg.id);
             setTimeout(() => seenMessageIds.delete(msg.id), 60_000);
+
+            // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
+            const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
+            if (seenContentKeys.has(contentKey)) {
+              onError(new Error(`Dedup(content): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+              return;
+            }
+            seenContentKeys.add(contentKey);
+            setTimeout(() => seenContentKeys.delete(contentKey), 5_000);
 
             await onMessage({
               chatId: msg.chat_id,
@@ -355,26 +367,22 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     },
 
     async sendCoordination(content: string): Promise<void> {
-      if (!coordChatId || !apiUrl || !apiBotToken) {
-        throw new Error("Coordination not configured (missing coordChatId, apiUrl, or apiBotToken)");
+      if (!coordChatId) {
+        throw new Error("Coordination not configured (missing coordChatId)");
       }
 
-      const res = await fetch(`${apiUrl}/api/v2/bot/message`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiBotToken}`,
-        },
-        body: JSON.stringify({
-          chat_id: coordChatId,
-          content,
-          message_type: "bot_coordination",
-        }),
+      // Direct Supabase insert — bot is signed in via auth, RLS allows insert as chat member.
+      // This bypasses the bot/message API route entirely (which had workspace_id validation issues).
+      const { error } = await supabase.from("messages").insert({
+        chat_id: coordChatId,
+        user_id: botUserId,
+        speaker: botDisplayName || "Bot",
+        content,
+        message_type: "bot_coordination",
       });
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Post to coordination HTTP ${res.status}: ${text.slice(0, 200)}`);
+      if (error) {
+        throw new Error(`Failed to send coordination message: ${error.message}`);
       }
     },
 

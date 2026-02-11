@@ -33,10 +33,18 @@ export interface CoordinationHandler {
   cleanup(): void;
 }
 
+export interface DispatchDecision {
+  roundId: string;
+  triggerMessageId: string | null;
+  shouldRespond: boolean;
+  synthesizeContext?: string;
+}
+
 export interface CoordinationHandlerOpts {
   botName: string;
   callGateway: (prompt: string, timeoutMs: number) => Promise<string | null>;
   postToCoordination: (content: string) => Promise<void>;
+  onDispatchDecision?: (decision: DispatchDecision) => Promise<void>;
   log: {
     info(m: string): void;
     warn(m: string): void;
@@ -66,6 +74,7 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     otherProposal?: Proposal;
     otherName?: string;
     triggerContent: string;
+    triggerMessageId: string | null;
     roundId: string;
     timeoutId: ReturnType<typeof setTimeout>;
   }
@@ -257,6 +266,31 @@ Choose ONE:
       }),
     );
     log.info(`READY (LOCKED): intent=${intent?.type || "claim"}, summary="${summary}"`);
+
+    // Signal dispatch decision — plugin uses this to dispatch or suppress
+    const finalIntent = intent || { type: "claim" as const, scope: round.myProposal.angle };
+    const shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
+
+    if (opts.onDispatchDecision) {
+      const synthesizeCtx = shouldRespond
+        ? `[Coordination round completed. Your angle: "${round.myProposal.angle}"${
+            round.otherName
+              ? `, ${round.otherName}'s angle: "${round.otherProposal?.angle || "unspecified"}"`
+              : ""
+          }. Division: ${summary}]`
+        : undefined;
+
+      try {
+        await opts.onDispatchDecision({
+          roundId: round.roundId,
+          triggerMessageId: round.triggerMessageId,
+          shouldRespond,
+          synthesizeContext: synthesizeCtx,
+        });
+      } catch (e: any) {
+        log.error(`onDispatchDecision failed: ${e.message}`);
+      }
+    }
   }
 
   async function handleTimeout(roundId: string): Promise<void> {
@@ -278,6 +312,7 @@ Choose ONE:
       phase: "proposed",
       myProposal: placeholder,
       triggerContent: parsed.trigger_content || "",
+      triggerMessageId: parsed.trigger_message_id || null,
       roundId,
       timeoutId,
     });

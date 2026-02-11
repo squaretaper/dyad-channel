@@ -203,6 +203,23 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // --- Create coordination handler (if configured) ---
       let coordination: CoordinationHandler | null = null;
 
+      // --- Pending dispatches for coordination-aware message handling ---
+      // When coordination is enabled, onMessage stores pending dispatches here
+      // instead of dispatching immediately. The coordination handler resolves
+      // them after negotiation (claim → dispatch, defer → skip).
+      const pendingDispatches = new Map<
+        string,
+        {
+          chatId: string;
+          text: string;
+          userId: string;
+          timeoutId: ReturnType<typeof setTimeout>;
+        }
+      >();
+
+      // Will be set after bus is created (needs bus.sendMessage)
+      let doDispatch: (chatId: string, text: string, userId: string) => Promise<void>;
+
       // Start bus with coordination opts wired in
       ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
       const bus = await startDyadBus({
@@ -213,59 +230,28 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         botEmail: account.botEmail,
         botPassword: account.botPassword,
         botDisplayName: account.botName,
-        onMessage: async ({ chatId, text, userId }) => {
+        onMessage: async ({ chatId, text, userId, messageId }) => {
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
-          try {
-            const rt = getDyadRuntime();
-            ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
+          // Coordination-aware dispatch: if coordination is active, hold dispatch
+          // and let the coordination handler decide based on negotiation outcome.
+          if (coordEnabled && coordination) {
+            const timeoutId = setTimeout(async () => {
+              const pending = pendingDispatches.get(messageId);
+              if (pending) {
+                pendingDispatches.delete(messageId);
+                ctx.log?.warn(`${tag} Coordination timeout for ${messageId.slice(0, 8)} — dispatching fallback`);
+                await doDispatch(chatId, text, userId);
+              }
+            }, 30_000);
 
-            const msgCtx = {
-              Body: text,
-              RawBody: text,
-              From: userId,
-              To: chatId,
-              SessionKey: `dyad:${chatId}`,
-              AccountId: account.accountId,
-              ChatType: "group",
-              Provider: "dyad",
-              Surface: "dyad",
-              OriginatingTo: chatId,
-              SenderId: userId,
-              CommandAuthorized: false,
-            };
-
-            // Dispatch through native OpenClaw agent pipeline (warm session)
-            const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-              ctx: msgCtx,
-              cfg: ctx.cfg,
-              dispatcherOptions: {
-                deliver: async (payload, { kind }) => {
-                  ctx.log?.info(`${tag} Delivering ${kind} reply (text=${!!payload.text}, error=${!!payload.isError})`);
-                  if (payload.text) {
-                    await bus.sendMessage(chatId, payload.text);
-                    ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
-                  }
-                },
-                onError: (err, { kind }) => {
-                  ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
-                },
-                onSkip: (payload, { kind, reason }) => {
-                  ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}, text=${payload.text?.slice(0, 80)}`);
-                },
-              },
-            });
-
-            ctx.log?.info(
-              `${tag} Dispatch result: queuedFinal=${result.queuedFinal}, counts=${JSON.stringify(result.counts)}`,
-            );
-
-            if (!result.queuedFinal) {
-              ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
-            }
-          } catch (err: any) {
-            ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
+            pendingDispatches.set(messageId, { chatId, text, userId, timeoutId });
+            ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, waiting for round`);
+            return;
           }
+
+          // No coordination — dispatch immediately
+          await doDispatch(chatId, text, userId);
         },
         onError: (error, context) => {
           ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
@@ -292,6 +278,59 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           : {}),
       });
 
+      // --- Native dispatch helper (uses bus.sendMessage for delivery) ---
+      doDispatch = async (chatId: string, text: string, userId: string) => {
+        try {
+          const rt = getDyadRuntime();
+          ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
+
+          const msgCtx = {
+            Body: text,
+            RawBody: text,
+            From: userId,
+            To: chatId,
+            SessionKey: `dyad:${chatId}`,
+            AccountId: account.accountId,
+            ChatType: "group",
+            Provider: "dyad",
+            Surface: "dyad",
+            OriginatingTo: chatId,
+            SenderId: userId,
+            CommandAuthorized: false,
+          };
+
+          const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: msgCtx,
+            cfg: ctx.cfg,
+            dispatcherOptions: {
+              deliver: async (payload, { kind }) => {
+                ctx.log?.info(`${tag} Delivering ${kind} reply (text=${!!payload.text}, error=${!!payload.isError})`);
+                if (payload.text) {
+                  await bus.sendMessage(chatId, payload.text);
+                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
+                }
+              },
+              onError: (err, { kind }) => {
+                ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
+              },
+              onSkip: (payload, { kind, reason }) => {
+                ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}, text=${payload.text?.slice(0, 80)}`);
+              },
+            },
+          });
+
+          ctx.log?.info(
+            `${tag} Dispatch result: queuedFinal=${result.queuedFinal}, counts=${JSON.stringify(result.counts)}`,
+          );
+
+          if (!result.queuedFinal) {
+            ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
+          }
+        } catch (err: any) {
+          ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
+        }
+      };
+
       // Create coordination handler after bus is ready (needs bus.sendCoordination)
       if (coordEnabled) {
         coordination = createCoordinationHandler({
@@ -302,6 +341,31 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               await bus.sendCoordination(content);
             } catch (e: any) {
               ctx.log?.error(`${tag} Post to coordination failed: ${e.message}`);
+            }
+          },
+          onDispatchDecision: async ({ triggerMessageId, shouldRespond, synthesizeContext }) => {
+            if (!triggerMessageId) {
+              ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
+              return;
+            }
+
+            const pending = pendingDispatches.get(triggerMessageId);
+            if (!pending) {
+              ctx.log?.warn(`${tag} [coord] No pending dispatch for ${triggerMessageId.slice(0, 8)} — may have timed out`);
+              return;
+            }
+
+            clearTimeout(pending.timeoutId);
+            pendingDispatches.delete(triggerMessageId);
+
+            if (shouldRespond) {
+              ctx.log?.info(`${tag} [coord] Dispatch decision: RESPOND for ${triggerMessageId.slice(0, 8)}`);
+              const prefixedText = synthesizeContext
+                ? `${synthesizeContext}\n\n${pending.text}`
+                : pending.text;
+              await doDispatch(pending.chatId, prefixedText, pending.userId);
+            } else {
+              ctx.log?.info(`${tag} [coord] Dispatch decision: SKIP for ${triggerMessageId.slice(0, 8)} (deferred/abstained)`);
             }
           },
           log: {
@@ -324,6 +388,12 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // Return cleanup function
       return {
         stop: () => {
+          // Clear pending dispatches
+          for (const [, pending] of pendingDispatches) {
+            clearTimeout(pending.timeoutId);
+          }
+          pendingDispatches.clear();
+
           if (coordination) {
             coordination.cleanup();
             coordination = null;
