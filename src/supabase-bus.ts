@@ -85,7 +85,7 @@ export interface DyadBusHandle {
 // Constants
 // ============================================================================
 
-const STALE_THRESHOLD_MS = 120_000; // 2 minutes without any event = stale
+const STALE_THRESHOLD_MS = 600_000; // 10 minutes without any event = stale
 const HEALTH_CHECK_INTERVAL_MS = 30_000; // check every 30s
 const KEEPALIVE_INTERVAL_MS = 60_000; // DB keepalive every 60s
 const RECONNECT_DELAY_MS = 5_000;
@@ -154,6 +154,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   let coordChannel: RealtimeChannel | null = null;
 
   // Dedup for coordination messages
+  const seenMessageIds = new Set<string>();
   const seenCoordIds = new Set<string>();
 
   // Interval handles for cleanup
@@ -188,6 +189,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
             if (msg.user_id === botUserId) {
               return;
             }
+
+            // Dedup — Realtime can deliver the same INSERT multiple times
+            if (seenMessageIds.has(msg.id)) return;
+            seenMessageIds.add(msg.id);
+            setTimeout(() => seenMessageIds.delete(msg.id), 60_000);
 
             await onMessage({
               chatId: msg.chat_id,
@@ -301,26 +307,23 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     }, HEALTH_CHECK_INTERVAL_MS),
   );
 
-  // Keepalive: query DB periodically to keep connection warm
-  if (coordChatId) {
-    intervals.push(
-      setInterval(async () => {
-        try {
-          const { error } = await supabase
-            .from("messages")
-            .select("id")
-            .eq("chat_id", coordChatId)
-            .order("created_at", { ascending: false })
-            .limit(1);
-          if (error) {
-            onError(new Error(error.message), "keepalive query");
-          }
-        } catch (e) {
-          onError(e as Error, "keepalive");
+  // Keepalive: query DB periodically to keep Realtime connection warm
+  intervals.push(
+    setInterval(async () => {
+      try {
+        const { error } = await supabase
+          .from("bot_tokens")
+          .select("id")
+          .eq("id", botId)
+          .limit(1);
+        if (error) {
+          onError(new Error(error.message), "keepalive query");
         }
-      }, KEEPALIVE_INTERVAL_MS),
-    );
-  }
+      } catch (e) {
+        onError(e as Error, "keepalive");
+      }
+    }, KEEPALIVE_INTERVAL_MS),
+  );
 
   // ============================================================================
   // Start subscriptions
