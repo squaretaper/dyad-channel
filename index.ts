@@ -21,8 +21,9 @@ const plugin: {
     api.registerChannel({ plugin: dyadPlugin });
 
     // Agent tools for inter-agent dialogue via #coordination channel
-    api.registerTool(createCoordSendTool(), { optional: true });
-    api.registerTool(createCoordHistoryTool(), { optional: true });
+    // Not optional — factory returns null when coordination isn't configured
+    api.registerTool(createCoordSendTool());
+    api.registerTool(createCoordHistoryTool());
   },
 };
 
