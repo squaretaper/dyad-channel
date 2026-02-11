@@ -33,6 +33,10 @@ export interface ResolvedDyadAccount {
   supabaseUrl: string;
   /** Supabase anon key from token */
   supabaseKey: string;
+  /** Bot email for Supabase auth (from token) */
+  botEmail: string;
+  /** Bot password for Supabase auth (from token) */
+  botPassword: string;
   /** Coordination chat ID (UUID) — null if coordination not configured */
   coordChatId: string | null;
   /** Dyad API URL for posting coordination messages */
@@ -118,6 +122,8 @@ export function resolveDyadAccount(opts: {
     botUserId: botToken?.uid ?? "",
     supabaseUrl: botToken?.url ?? "",
     supabaseKey: botToken?.key ?? "",
+    botEmail: botToken?.email ?? "",
+    botPassword: botToken?.pwd ?? "",
     coordChatId: dyadCfg?.coordChatId?.trim() || null,
     apiUrl: dyadCfg?.apiUrl?.trim() || botToken?.apiUrl || "https://dyadai.vercel.app",
     apiBotToken: dyadCfg?.botToken?.trim() || null,

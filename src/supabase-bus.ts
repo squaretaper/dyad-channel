@@ -36,6 +36,10 @@ export interface DyadBusOptions {
   botId: string;
   /** Bot's user ID in Dyad (used as speaker identity) */
   botUserId: string;
+  /** Bot email for Supabase auth sign-in */
+  botEmail?: string;
+  /** Bot password for Supabase auth sign-in */
+  botPassword?: string;
   /** Called when a new message arrives for the bot */
   onMessage: (msg: {
     chatId: string;
@@ -103,6 +107,8 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     supabaseKey,
     botId,
     botUserId,
+    botEmail,
+    botPassword,
     onMessage,
     onError,
     onConnect,
@@ -122,6 +128,17 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       },
     },
   });
+
+  // Sign in as the bot user so Realtime subscriptions pass RLS
+  if (botEmail && botPassword) {
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: botEmail,
+      password: botPassword,
+    });
+    if (signInError) {
+      onError(new Error(`Bot sign-in failed: ${signInError.message}`), "auth");
+    }
+  }
 
   // Subscription health tracking
   let lastEventTime = Date.now();

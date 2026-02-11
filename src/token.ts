@@ -16,6 +16,10 @@ export interface DyadBotToken {
   url: string;
   /** Supabase anon key (public, RLS-scoped) */
   key: string;
+  /** Bot email for Supabase auth sign-in */
+  email?: string;
+  /** Bot password for Supabase auth sign-in */
+  pwd?: string;
   /** Dyad API URL (optional, e.g. https://dyadai.vercel.app) */
   apiUrl?: string;
   /** Issuer (optional, always "dyad") */
@@ -83,6 +87,8 @@ export function decodeBotToken(encoded: string): DyadBotToken {
     uid: parsed.uid,
     url: parsed.url,
     key: parsed.key,
+    email: parsed.email,
+    pwd: parsed.pwd,
     apiUrl: parsed.apiUrl,
     iss: parsed.iss ?? "dyad",
     iat: parsed.iat,

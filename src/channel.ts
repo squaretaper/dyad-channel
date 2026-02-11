@@ -211,6 +211,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         supabaseKey: account.supabaseKey,
         botId: account.botId,
         botUserId: account.botUserId,
+        botEmail: account.botEmail,
+        botPassword: account.botPassword,
         onMessage: async ({ chatId, text, userId }) => {
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
