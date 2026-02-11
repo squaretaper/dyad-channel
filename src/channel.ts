@@ -217,36 +217,47 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
           try {
             const rt = getDyadRuntime();
+            ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
+
+            const msgCtx = {
+              Body: text,
+              RawBody: text,
+              From: userId,
+              To: chatId,
+              SessionKey: `dyad:${chatId}`,
+              AccountId: account.accountId,
+              ChatType: "group",
+              Provider: "dyad",
+              Surface: "dyad",
+              OriginatingTo: chatId,
+              SenderId: userId,
+              CommandAuthorized: false,
+            };
 
             // Dispatch through native OpenClaw agent pipeline (warm session)
             const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-              ctx: {
-                Body: text,
-                RawBody: text,
-                From: userId,
-                To: chatId,
-                SessionKey: `dyad:${chatId}`,
-                AccountId: account.accountId,
-                ChatType: "group",
-                Provider: "dyad",
-                Surface: "dyad",
-                OriginatingTo: chatId,
-                SenderId: userId,
-                CommandAuthorized: false,
-              },
+              ctx: msgCtx,
               cfg: ctx.cfg,
               dispatcherOptions: {
-                deliver: async (payload) => {
+                deliver: async (payload, { kind }) => {
+                  ctx.log?.info(`${tag} Delivering ${kind} reply (text=${!!payload.text}, error=${!!payload.isError})`);
                   if (payload.text) {
                     await bus.sendMessage(chatId, payload.text);
                     ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
                   }
                 },
-                onError: (err) => {
-                  ctx.log?.error(`${tag} Dispatch error: ${err}`);
+                onError: (err, { kind }) => {
+                  ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
+                },
+                onSkip: (payload, { kind, reason }) => {
+                  ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}, text=${payload.text?.slice(0, 80)}`);
                 },
               },
             });
+
+            ctx.log?.info(
+              `${tag} Dispatch result: queuedFinal=${result.queuedFinal}, counts=${JSON.stringify(result.counts)}`,
+            );
 
             if (!result.queuedFinal) {
               ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);

@@ -1,6 +1,7 @@
 {
   "id": "dyad",
-  "entry": "src/entry.ts",
+  "channels": ["dyad"],
+  "entry": "index.ts",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
