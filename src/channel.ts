@@ -344,14 +344,34 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         }
       };
 
-      // Create coordination handler after bus is ready (needs bus.sendCoordination)
+      // Create coordination handler after bus is ready
       if (coordEnabled) {
         coordination = createCoordinationHandler({
           botName: account.botName,
           callGateway,
+          // Post to coordination via API route (same pattern as the sidecar).
+          // The API route uses service role client → bypasses RLS.
+          // Direct Supabase inserts require bot auth + RLS and fail silently.
           postToCoordination: async (content: string) => {
             try {
-              await bus.sendCoordination(content);
+              const res = await fetch(`${account.apiUrl}/api/v2/bot/message`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${account.apiBotToken}`,
+                },
+                body: JSON.stringify({
+                  chat_id: account.coordChatId,
+                  content,
+                  message_type: "bot_coordination",
+                }),
+              });
+              if (!res.ok) {
+                const text = await res.text().catch(() => "");
+                ctx.log?.error(
+                  `${tag} Post to coordination HTTP ${res.status}: ${text.slice(0, 200)}`,
+                );
+              }
             } catch (e: any) {
               ctx.log?.error(`${tag} Post to coordination failed: ${e.message}`);
             }
