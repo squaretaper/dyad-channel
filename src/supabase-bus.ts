@@ -159,6 +159,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   const seenMessageIds = new Set<string>();
   const seenContentKeys = new Set<string>();
   const seenCoordIds = new Set<string>();
+  const seenCoordContentKeys = new Set<string>();
 
   // Interval handles for cleanup
   const intervals: ReturnType<typeof setInterval>[] = [];
@@ -266,18 +267,27 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
             // Skip own messages
             if (botName && msg.speaker === botName) return;
 
-            // Dedup
+            // Dedup layer 1: ID-based
             if (seenCoordIds.has(msg.id)) return;
             seenCoordIds.add(msg.id);
             setTimeout(() => seenCoordIds.delete(msg.id), 60_000);
 
-            // Parse content
+            // Parse content (needed for dedup key extraction)
             let parsed: any = null;
             try {
               parsed = JSON.parse(msg.content);
             } catch {
               // Leave null — handler deals with unparseable messages
             }
+
+            // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
+            // Use round_id + kind + speaker for structured messages, fall back to content slice
+            const coordKey = parsed?.round_id
+              ? `${parsed.round_id}:${parsed.kind || parsed.intent?.type || "unknown"}:${msg.speaker}`
+              : `${msg.speaker}:${(msg.content || "").slice(0, 80)}`;
+            if (seenCoordContentKeys.has(coordKey)) return;
+            seenCoordContentKeys.add(coordKey);
+            setTimeout(() => seenCoordContentKeys.delete(coordKey), 10_000);
 
             await onCoordinationMessage({
               id: msg.id,
