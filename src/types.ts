@@ -19,10 +19,16 @@ export interface ResolvedDyadAccount {
   name?: string;
   enabled: boolean;
   configured: boolean;
+  /** Raw bot token string — OpenClaw framework checks this as string for readiness */
+  botToken: string;
+  /** Raw app token string — OpenClaw framework requires this for readiness (reuse compound token) */
+  appToken: string;
   /** Decoded bot token (null if not configured or invalid) */
-  botToken: DyadBotToken | null;
-  /** Workspace ID from token */
+  decodedToken: DyadBotToken | null;
+  /** Workspace ID from token (first entry, backward compat) */
   workspaceId: string;
+  /** All workspace IDs this bot can access (user-scoped) */
+  workspaceIds: string[];
   /** Bot ID from token */
   botId: string;
   /** Bot user ID from token */
@@ -109,8 +115,11 @@ export function resolveDyadAccount(opts: {
     name: dyadCfg?.name?.trim() || undefined,
     enabled: baseEnabled,
     configured,
-    botToken,
-    workspaceId: botToken?.wid ?? "",
+    botToken: rawToken.trim(),
+    appToken: rawToken.trim(), // Dyad uses single compound token for both
+    decodedToken: botToken,
+    workspaceIds: botToken?.wids ?? (botToken?.wid ? [botToken.wid] : []),
+    workspaceId: botToken?.wids?.[0] ?? botToken?.wid ?? "",
     botId: botToken?.sub ?? "",
     botUserId: botToken?.uid ?? "",
     supabaseUrl: botToken?.url ?? "",

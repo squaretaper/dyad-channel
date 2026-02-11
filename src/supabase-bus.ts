@@ -32,8 +32,8 @@ export interface DyadBusOptions {
   supabaseUrl: string;
   /** Supabase anon key (RLS-scoped) */
   supabaseKey: string;
-  /** Workspace ID to scope messages */
-  workspaceId: string;
+  /** Workspace IDs to scope messages (user-scoped: all owner's workspaces) */
+  workspaceIds: string[];
   /** Bot ID (from bot_tokens) */
   botId: string;
   /** Bot's user ID in Dyad (used as speaker identity) */
@@ -95,7 +95,7 @@ const RECONNECT_DELAY_MS = 5_000;
  *
  * Subscribes to INSERT events on `public.messages` where
  * `message_type=eq.claude_request`, verifies the message belongs to
- * the configured workspace, and routes to the onMessage callback.
+ * an accessible workspace, and routes to the onMessage callback.
  *
  * If coordChatId is provided, also subscribes to coordination messages.
  */
@@ -103,7 +103,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   const {
     supabaseUrl,
     supabaseKey,
-    workspaceId,
+    workspaceIds,
     botId,
     botUserId,
     onMessage,
@@ -117,6 +117,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     onCoordinationMessage,
   } = opts;
 
+  // Fast lookup set for workspace ownership verification
+  const workspaceIdSet = new Set(workspaceIds);
+
   // Create Supabase client
   const supabase = createClient(supabaseUrl, supabaseKey, {
     realtime: {
@@ -126,8 +129,8 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     },
   });
 
-  // Track known chat IDs that belong to this workspace (cache)
-  const workspaceChatIds = new Set<string>();
+  // Track known chat IDs that belong to accessible workspaces (cache)
+  const accessibleChatIds = new Set<string>();
 
   // Subscription health tracking
   let lastEventTime = Date.now();
@@ -140,18 +143,18 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Interval handles for cleanup
   const intervals: ReturnType<typeof setInterval>[] = [];
 
-  // Pre-load workspace chats
+  // Pre-load chats for all accessible workspaces
   try {
     const { data: chats, error } = await supabase
       .from("chats")
       .select("id")
-      .eq("workspace_id", workspaceId);
+      .in("workspace_id", workspaceIds);
 
     if (error) {
       onError(new Error(error.message), "load workspace chats");
     } else if (chats) {
       for (const chat of chats) {
-        workspaceChatIds.add(chat.id);
+        accessibleChatIds.add(chat.id);
       }
     }
   } catch (err) {
@@ -188,19 +191,19 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
 
-            // Verify this chat belongs to our workspace
-            if (!workspaceChatIds.has(msg.chat_id)) {
+            // Verify this chat belongs to an accessible workspace
+            if (!accessibleChatIds.has(msg.chat_id)) {
               const { data: chat, error } = await supabase
                 .from("chats")
                 .select("id, workspace_id")
                 .eq("id", msg.chat_id)
                 .single();
 
-              if (error || !chat || chat.workspace_id !== workspaceId) {
+              if (error || !chat || !workspaceIdSet.has(chat.workspace_id)) {
                 return;
               }
 
-              workspaceChatIds.add(msg.chat_id);
+              accessibleChatIds.add(msg.chat_id);
             }
 
             await onMessage({
