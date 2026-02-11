@@ -1,5 +1,5 @@
 {
-  "name": "@dyad/openclaw-channel",
+  "name": "@dyad/dyad",
   "version": "0.1.0",
   "description": "OpenClaw channel plugin for Dyad AI workspaces",
   "type": "module",

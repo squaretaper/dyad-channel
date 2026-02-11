@@ -55,9 +55,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
   security: {
     resolveDmPolicy: ({ account }) => {
       return {
-        // Dyad uses workspace membership for access control,
-        // so default DM policy is "open" within the workspace
-        policy: account.config.dmPolicy ?? "open",
+        // Dyad handles access control via Supabase workspace membership,
+        // not OpenClaw's DM policy system
+        policy: account.config.dmPolicy ?? "disabled",
         allowFrom: [],
         policyPath: "channels.dyad.dmPolicy",
         allowFromPath: "channels.dyad.allowFrom",
