@@ -42,7 +42,7 @@ export interface DispatchDecision {
 
 export interface CoordinationHandlerOpts {
   botName: string;
-  callGateway: (prompt: string, timeoutMs: number) => Promise<string | null>;
+  callGateway: (prompt: string, timeoutMs: number, sessionHint?: string) => Promise<string | null>;
   postToCoordination: (content: string) => Promise<void>;
   onDispatchDecision?: (decision: DispatchDecision) => Promise<void>;
   log: {
@@ -146,6 +146,7 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
   // --- Gateway prompt helpers ---
 
   async function generateProposal(roundStart: any): Promise<Proposal | null> {
+    const roundId = roundStart.round_id;
     const prompt = `[COORDINATION — propose your contribution. Respond with JSON only, no other text]
 Message from user: "${(roundStart.trigger_content || "").slice(0, 500)}"
 
@@ -154,7 +155,7 @@ What unique angle would you bring? Respond with structured proposal:
 
 Example: {"angle": "protocol design", "covers": ["negotiation flow", "resolution signals"], "defers": ["Supabase implementation"]}`;
 
-    const content = await callGateway(prompt, 15000);
+    const content = await callGateway(prompt, 15000, roundId ? `round:${roundId}` : undefined);
     if (!content) return null;
 
     try {
@@ -187,7 +188,7 @@ Either accept as-is or revise your covers to avoid overlap:
 - {"decision": "accept"} — overlap is minor, proceed as-is
 - {"decision": "counter", "angle": "<revised>", "covers": ["<non-overlapping topics>"], "defers": ["<what you leave>"]}`;
 
-    const content = await callGateway(prompt, 8000);
+    const content = await callGateway(prompt, 8000, `round:${round.roundId}`);
     if (!content) return { accept: true };
 
     try {
@@ -225,7 +226,7 @@ Choose ONE:
 - {"type":"defer","to":"${round.otherName || "other"}","reason":"<why>"}
 - {"type":"abstain","reason":"<why>"}`;
 
-    const content = await callGateway(prompt, 8000);
+    const content = await callGateway(prompt, 8000, `round:${round.roundId}`);
     if (!content) return { type: "claim", scope: round.myProposal.angle };
 
     try {
@@ -551,7 +552,7 @@ Choose ONE:
         `AgentMessage from ${speaker}: ${parsed.kind} (depth=${depth}) — ${parsed.content?.slice(0, 80)}`,
       );
 
-      const response = await callGateway(`${prefix} ${kindLabel}]: ${parsed.content}`, 30000);
+      const response = await callGateway(`${prefix} ${kindLabel}]: ${parsed.content}`, 30000, "dialogue");
 
       // Post reply back to #coordination if expects_reply and under depth cap
       if (
@@ -586,6 +587,7 @@ Choose ONE:
         await callGateway(
           `[${speaker} signals ${parsed.signal}${parsed.summary ? `: ${parsed.summary}` : ""}]`,
           30000,
+          "misc",
         );
       }
       return;
@@ -604,6 +606,7 @@ Choose ONE:
       const response = await callGateway(
         `[Coordination — ${speaker}]: ${parsed.content}`,
         30000,
+        "dialogue",
       );
 
       if (isValidResponse(response) && depth < MAX_COORDINATION_DEPTH) {
@@ -629,6 +632,7 @@ Choose ONE:
         await callGateway(
           `[Coordination from ${speaker}]: ${JSON.stringify(parsed).slice(0, 300)}`,
           30000,
+          "misc",
         );
       }
       return;
@@ -637,7 +641,7 @@ Choose ONE:
     // Unparseable free-form message
     if (!parsed) {
       if (!hasActiveRound()) {
-        await callGateway(`[Coordination from ${speaker}]: ${msg.content}`, 30000);
+        await callGateway(`[Coordination from ${speaker}]: ${msg.content}`, 30000, "misc");
       }
       return;
     }

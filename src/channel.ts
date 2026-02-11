@@ -168,18 +168,31 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         account.coordChatId && account.apiBotToken && account.gatewayToken,
       );
 
+      // Concurrency semaphore — cap parallel gateway calls to prevent session explosion
+      const MAX_CONCURRENT_GATEWAY_CALLS = 3;
+      let activeGatewayCalls = 0;
+      const gatewayQueue: Array<() => void> = [];
+
       async function callGateway(
         prompt: string,
         timeoutMs: number,
         retries: number = 1,
+        sessionHint?: string,
       ): Promise<string | null> {
         for (let attempt = 0; attempt <= retries; attempt++) {
+          // Concurrency guard — wait if at capacity
+          if (activeGatewayCalls >= MAX_CONCURRENT_GATEWAY_CALLS) {
+            await new Promise<void>(resolve => gatewayQueue.push(resolve));
+          }
+          activeGatewayCalls++;
           try {
             const thisTimeout = attempt === 0 ? timeoutMs : timeoutMs * 2;
-            // Use a unique session per call to prevent:
-            // 1. Session contamination (conversation history bleed between rounds)
-            // 2. Gateway routing responses to existing chat sessions via outbound
-            const sessionId = `dyad:coord:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            // Use hint-based stable session IDs to reuse gateway sessions within
+            // a coordination round, preventing unbounded session creation.
+            // Hints: "round:<id>" for Layer 1, "dialogue"/"misc" for Layer 2.
+            const sessionId = sessionHint
+              ? `dyad:coord:${sessionHint}`
+              : `dyad:coord:misc:${Date.now()}`;
             const res = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
@@ -208,6 +221,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               const backoff = 2000 * (attempt + 1);
               await new Promise((r) => setTimeout(r, backoff));
             }
+          } finally {
+            activeGatewayCalls--;
+            gatewayQueue.shift()?.();
           }
         }
         return null;
@@ -230,6 +246,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         }
       >();
 
+      // Track message IDs that have already been dispatched (or are being dispatched).
+      // Prevents duplicate Realtime INSERT events (~4ms apart) from triggering
+      // two coordination rounds that both resolve → double dispatch → dropped reply.
+      const dispatched = new Set<string>();
+
       // Will be set after bus is created (needs bus.sendMessage)
       let doDispatch: (chatId: string, text: string, userId: string) => Promise<void>;
 
@@ -249,10 +270,25 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           // Coordination-aware dispatch: if coordination is active, hold dispatch
           // and let the coordination handler decide based on negotiation outcome.
           if (coordEnabled && coordination) {
+            // Guard: duplicate Realtime INSERTs arrive ~4ms apart with different
+            // notification IDs but the same messageId. Skip if already pending or dispatched.
+            if (pendingDispatches.has(messageId)) {
+              ctx.log?.warn(`${tag} Duplicate onMessage for ${messageId.slice(0, 8)} — already pending, skipping`);
+              return;
+            }
+            if (dispatched.has(messageId)) {
+              ctx.log?.warn(`${tag} Duplicate onMessage for ${messageId.slice(0, 8)} — already dispatched, skipping`);
+              return;
+            }
+
             const timeoutId = setTimeout(async () => {
               const pending = pendingDispatches.get(messageId);
               if (pending) {
                 pendingDispatches.delete(messageId);
+                // Check dispatched guard — another path may have dispatched during the wait
+                if (dispatched.has(messageId)) return;
+                dispatched.add(messageId);
+                setTimeout(() => dispatched.delete(messageId), 60_000);
                 ctx.log?.warn(`${tag} Coordination timeout for ${messageId.slice(0, 8)} — dispatching fallback`);
                 await doDispatch(chatId, text, userId);
               }
@@ -348,7 +384,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       if (coordEnabled) {
         coordination = createCoordinationHandler({
           botName: account.botName,
-          callGateway,
+          callGateway: (prompt, timeoutMs, sessionHint) => callGateway(prompt, timeoutMs, 1, sessionHint),
           // Post to coordination via API route (same pattern as the sidecar).
           // The API route uses service role client → bypasses RLS.
           // Direct Supabase inserts require bot auth + RLS and fail silently.
@@ -381,6 +417,16 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
               return;
             }
+
+            // Primary double-dispatch guard: synchronous check + add is atomic in
+            // single-threaded JS. If two coordination rounds both resolve for the
+            // same trigger, only the first one passes this gate.
+            if (dispatched.has(triggerMessageId)) {
+              ctx.log?.warn(`${tag} [coord] Already dispatched ${triggerMessageId.slice(0, 8)} — ignoring duplicate decision`);
+              return;
+            }
+            dispatched.add(triggerMessageId);
+            setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
 
             const pending = pendingDispatches.get(triggerMessageId);
             if (!pending) {
@@ -426,6 +472,12 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             clearTimeout(pending.timeoutId);
           }
           pendingDispatches.clear();
+          dispatched.clear();
+
+          // Drain gateway concurrency semaphore
+          activeGatewayCalls = 0;
+          for (const resolve of gatewayQueue) resolve();
+          gatewayQueue.length = 0;
 
           if (coordination) {
             coordination.cleanup();
