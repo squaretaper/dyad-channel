@@ -204,6 +204,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       let coordination: CoordinationHandler | null = null;
 
       // Start bus with coordination opts wired in
+      ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
       const bus = await startDyadBus({
         supabaseUrl: account.supabaseUrl,
         supabaseKey: account.supabaseKey,
