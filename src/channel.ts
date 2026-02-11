@@ -12,7 +12,6 @@ import {
   type ResolvedDyadAccount,
 } from "./types.js";
 import { createCoordinationHandler, type CoordinationHandler } from "./coordination.js";
-import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -216,40 +215,35 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
           try {
-            const rt = getDyadRuntime();
-
-            // Dispatch through native OpenClaw agent pipeline (warm session)
-            const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-              ctx: {
-                Body: text,
-                RawBody: text,
-                From: userId,
-                To: chatId,
-                SessionKey: `dyad:${chatId}`,
-                AccountId: account.accountId,
-                ChatType: "group",
-                Provider: "dyad",
-                Surface: "dyad",
-                OriginatingTo: chatId,
-                SenderId: userId,
-                CommandAuthorized: false,
+            // Call OpenClaw gateway — session context managed by OpenClaw via user key
+            const gatewayRes = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(account.gatewayToken ? { Authorization: `Bearer ${account.gatewayToken}` } : {}),
               },
-              cfg: ctx.cfg,
-              dispatcherOptions: {
-                deliver: async (payload) => {
-                  if (payload.text) {
-                    await bus.sendMessage(chatId, payload.text);
-                    ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
-                  }
-                },
-                onError: (err) => {
-                  ctx.log?.error(`${tag} Dispatch error: ${err}`);
-                },
-              },
+              body: JSON.stringify({
+                model: "openclaw:main",
+                user: `dyad:${chatId}`,
+                messages: [{ role: "user", content: text }],
+              }),
+              signal: AbortSignal.timeout(120_000),
             });
 
-            if (!result.queuedFinal) {
-              ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
+            if (!gatewayRes.ok) {
+              const errText = await gatewayRes.text().catch(() => "unknown");
+              ctx.log?.error(`${tag} Gateway error ${gatewayRes.status}: ${errText.slice(0, 200)}`);
+              return;
+            }
+
+            const result = await gatewayRes.json();
+            const responseText = result?.choices?.[0]?.message?.content?.trim();
+
+            if (responseText) {
+              await bus.sendMessage(chatId, responseText);
+              ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${responseText.length} chars)`);
+            } else {
+              ctx.log?.warn(`${tag} Gateway returned empty response`);
             }
           } catch (err: any) {
             ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
