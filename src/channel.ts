@@ -148,7 +148,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       ctx.setStatus({
         accountId: account.accountId,
       });
-      ctx.log?.info(`${tag} Starting Dyad provider (${account.workspaceIds.length} workspace(s))`);
+      ctx.log?.info(`${tag} Starting Dyad provider`);
 
       if (!account.configured || !account.decodedToken) {
         throw new Error("Dyad bot token not configured or invalid");
@@ -209,7 +209,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       const bus = await startDyadBus({
         supabaseUrl: account.supabaseUrl,
         supabaseKey: account.supabaseKey,
-        workspaceIds: account.workspaceIds,
         botId: account.botId,
         botUserId: account.botUserId,
         onMessage: async ({ chatId, text, userId }) => {
@@ -241,7 +240,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
         },
         onConnect: () => {
-          ctx.log?.info(`${tag} Connected to Supabase Realtime (${account.workspaceIds.length} workspace(s))`);
+          ctx.log?.info(`${tag} Connected to Supabase Realtime`);
         },
         onDisconnect: () => {
           ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
@@ -289,9 +288,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // Store the bus handle
       activeBuses.set(account.accountId, bus);
 
-      ctx.log?.info(
-        `${tag} Dyad provider started, listening for messages in ${account.workspaceIds.length} workspace(s)`,
-      );
+      ctx.log?.info(`${tag} Dyad provider started, listening for messages`);
 
       // Return cleanup function
       return {

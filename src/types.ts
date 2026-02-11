@@ -25,10 +25,6 @@ export interface ResolvedDyadAccount {
   appToken: string;
   /** Decoded bot token (null if not configured or invalid) */
   decodedToken: DyadBotToken | null;
-  /** Workspace ID from token (first entry, backward compat) */
-  workspaceId: string;
-  /** All workspace IDs this bot can access (user-scoped) */
-  workspaceIds: string[];
   /** Bot ID from token */
   botId: string;
   /** Bot user ID from token */
@@ -118,8 +114,6 @@ export function resolveDyadAccount(opts: {
     botToken: rawToken.trim(),
     appToken: rawToken.trim(), // Dyad uses single compound token for both
     decodedToken: botToken,
-    workspaceIds: botToken?.wids ?? (botToken?.wid ? [botToken.wid] : []),
-    workspaceId: botToken?.wids?.[0] ?? botToken?.wid ?? "",
     botId: botToken?.sub ?? "",
     botUserId: botToken?.uid ?? "",
     supabaseUrl: botToken?.url ?? "",
