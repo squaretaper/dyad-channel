@@ -20,10 +20,11 @@ const plugin: {
     setDyadRuntime(api.runtime);
     api.registerChannel({ plugin: dyadPlugin });
 
-    // Agent tools for inter-agent dialogue via #coordination channel
-    // Not optional — factory returns null when coordination isn't configured
-    api.registerTool(createCoordSendTool());
-    api.registerTool(createCoordHistoryTool());
+    // Agent tools for inter-agent dialogue via #coordination channel.
+    // names: hints let OpenClaw discover tool names before running the factory.
+    // No optional: true — factory returns null when coordination isn't configured.
+    api.registerTool(createCoordSendTool(), { names: ["dyad_coord_send"] });
+    api.registerTool(createCoordHistoryTool(), { names: ["dyad_coord_history"] });
   },
 };
 
