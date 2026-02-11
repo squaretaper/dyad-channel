@@ -191,7 +191,10 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
             }
 
             // Dedup — Realtime can deliver the same INSERT multiple times
-            if (seenMessageIds.has(msg.id)) return;
+            if (seenMessageIds.has(msg.id)) {
+              onError(new Error(`Dedup: skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+              return;
+            }
             seenMessageIds.add(msg.id);
             setTimeout(() => seenMessageIds.delete(msg.id), 60_000);
 
