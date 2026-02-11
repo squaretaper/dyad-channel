@@ -303,6 +303,14 @@ Choose ONE:
 
   async function handleRoundStart(parsed: any): Promise<void> {
     const roundId = parsed.round_id;
+
+    // Dedup: skip if we're already handling this round (covers Realtime re-delivery
+    // with different notification IDs but same round_id)
+    if (rounds.has(roundId)) {
+      log.info(`Round ${roundId} already in progress — skipping duplicate round_start`);
+      return;
+    }
+
     log.info(`Round ${roundId} started — generating PROPOSE`);
 
     // Create round state BEFORE gateway call so incoming PROPOSEs aren't dropped

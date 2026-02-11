@@ -88,6 +88,15 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       if (!bus) {
         throw new Error(`Dyad bus not running for account ${aid}`);
       }
+
+      // Guard: only deliver to valid chat UUIDs.
+      // The gateway may route callGateway responses (coordination LLM calls)
+      // through outbound — those use non-UUID targets like "dyad:coord:*".
+      // Silently skip to prevent coordination JSON from appearing as chat messages.
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(to)) {
+        return { channel: "dyad" as const, messageId: "", to };
+      }
+
       await bus.sendMessage(to, text ?? "");
       return { channel: "dyad" as const, messageId: "", to };
     },
@@ -167,6 +176,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         for (let attempt = 0; attempt <= retries; attempt++) {
           try {
             const thisTimeout = attempt === 0 ? timeoutMs : timeoutMs * 2;
+            // Use a unique session per call to prevent:
+            // 1. Session contamination (conversation history bleed between rounds)
+            // 2. Gateway routing responses to existing chat sessions via outbound
+            const sessionId = `dyad:coord:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             const res = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
@@ -175,7 +188,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               },
               body: JSON.stringify({
                 model: "openclaw:main",
-                user: "dyad:coord",
+                user: sessionId,
                 messages: [{ role: "user", content: prompt }],
               }),
               signal: AbortSignal.timeout(thisTimeout),
