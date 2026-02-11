@@ -215,25 +215,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
           try {
-            // Fetch recent conversation history for context
-            const { data: recentMessages } = await bus.client
-              .from("messages")
-              .select("speaker, content, message_type")
-              .eq("chat_id", chatId)
-              .order("created_at", { ascending: false })
-              .limit(20);
-
-            // Build messages array for gateway (chronological order)
-            const history = (recentMessages || []).reverse().map((msg: any) => ({
-              role: msg.message_type === "claude_response" || msg.message_type === "bot_response"
-                ? "assistant" as const
-                : "user" as const,
-              content: msg.message_type === "claude_response" || msg.message_type === "bot_response"
-                ? msg.content
-                : `${msg.speaker}: ${msg.content}`,
-            }));
-
-            // Call OpenClaw gateway for LLM response
+            // Call OpenClaw gateway — session context managed by OpenClaw via user key
             const gatewayRes = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
@@ -243,7 +225,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               body: JSON.stringify({
                 model: "openclaw:main",
                 user: `dyad:${chatId}`,
-                messages: history,
+                messages: [{ role: "user", content: text }],
               }),
               signal: AbortSignal.timeout(120_000),
             });
