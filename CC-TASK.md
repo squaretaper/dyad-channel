@@ -1,9 +1,15 @@
 # CC Task: Complete Dyad Channel Plugin
 
+## Status: COMPLETE
+
+All planned work has been implemented and tested. The plugin fully replaces the standalone sidecar processes. See "Implementation Notes" below for deviations from the original plan.
+
+---
+
 ## Objective
 Complete the Dyad channel plugin so it replaces the standalone sidecar processes. The scaffold is already in place — the work is enhancing `supabase-bus.ts` with coordination protocol support and wiring everything together.
 
-## Current State
+## Original State (Before)
 - Plugin scaffold exists at `/Users/joshua/projects/dyad/dyad-channel/`
 - Files: `index.ts`, `src/channel.ts`, `src/supabase-bus.ts`, `src/types.ts`, `src/token.ts`, `src/config-schema.ts`, `src/runtime.ts`
 - The scaffold already handles basic human messages (`claude_request`) via Supabase Realtime
@@ -14,10 +20,10 @@ Complete the Dyad channel plugin so it replaces the standalone sidecar processes
 - **Coordination types**: `/Users/joshua/projects/dyad/dyadai-repo/lib/coordination/types.ts`
 - **Reference channel plugin (Nostr)**: `/opt/homebrew/lib/node_modules/openclaw/extensions/nostr/`
 
-## What to Build
+## What Was Built
 
-### 1. New file: `src/coordination.ts` (~250 lines)
-Port the coordination protocol from the sidecar into a standalone module:
+### 1. `src/coordination.ts` -- DONE
+Ported the coordination protocol from the sidecar into a standalone module (~650 lines).
 
 ```typescript
 export interface CoordinationHandler {
@@ -34,130 +40,76 @@ export function createCoordinationHandler(opts: {
 }): CoordinationHandler;
 ```
 
-Port from sidecar:
-- `RoundState` interface and `rounds` Map
-- `handleRoundStart`, `handlePropose`, `handleAccept`, `handleCounter`, `handleReady`, `handleTimeout`, `lockRound`
-- `generateProposal`, `generateCounterOrAccept`, `generateFinalIntent`
-- `coversOverlap` mechanical diff
-- `isValidResponse` filter
-- Dedup tracking (`seenMessageIds`)
-- Constants: `ROUND_TIMEOUT_MS=12000`, `ROUND_CLEANUP_MS=30000`, `MAX_COORDINATION_DEPTH` (import from types or define as 6)
-- `COORDINATION_PROTOCOL_VERSION` (import from types or define as "1.0")
+Ported from sidecar:
+- [x] `RoundState` interface and `rounds` Map
+- [x] `handleRoundStart`, `handlePropose`, `handleAccept`, `handleCounter`, `handleReady`, `handleTimeout`, `lockRound`
+- [x] `generateProposal`, `generateCounterOrAccept`, `generateFinalIntent`
+- [x] `coversOverlap` mechanical diff
+- [x] `isValidResponse` filter
+- [x] Dedup tracking (`seenMessageIds`)
+- [x] Constants: `ROUND_TIMEOUT_MS=12000`, `ROUND_CLEANUP_MS=30000`, `MAX_COORDINATION_DEPTH` (imported from types-coordination)
+- [x] `COORDINATION_PROTOCOL_VERSION` (imported from types-coordination)
+- [x] `DispatchDecision` interface + `onDispatchDecision` callback (signals claim/defer to channel.ts)
+- [x] `triggerMessageId` tracking through round state (links coordination rounds back to the message that triggered them)
 
-### 2. Update `src/supabase-bus.ts`
-Enhance the existing bus to:
+### 2. `src/supabase-bus.ts` -- DONE
 
-a) **Subscribe to coordination channel** — second Realtime subscription filtered by `chat_id=eq.<coordChatId>` on INSERT
-b) **Add staleness watchdog** — detect stale subscriptions (2 min silence) and reconnect
-c) **Add keepalive** — periodic DB query to keep connection warm (60s interval)
-d) **Add reconnection** — on CHANNEL_ERROR or TIMED_OUT, retry after 5s
-e) **Route coordination messages** through `onCoordinationMessage` callback
-f) **Add `sendCoordination(content: string)`** method to `DyadBusHandle` — POST to `${apiUrl}/api/v2/bot/message` with bot token auth
-g) **Add crash protection** — catch unhandled errors in handlers
+- [x] Subscribe to coordination channel — second Realtime subscription filtered by `chat_id=eq.<coordChatId>` on INSERT
+- [x] Staleness watchdog — 10-minute silence threshold triggers reconnect (checked every 30s)
+- [x] Keepalive — periodic DB query every 60s to keep connection warm
+- [x] Reconnection — on CHANNEL_ERROR or TIMED_OUT, retry after 5s
+- [x] Route coordination messages through `onCoordinationMessage` callback
+- [x] `sendCoordination(content: string)` — **direct Supabase insert** (see Implementation Notes)
+- [x] Crash protection — try/catch around all handlers
+- [x] Dual-layer dedup on message subscription: ID-based (60s TTL) + content-based `${chat_id}:${user_id}:${content.slice(0,80)}` (5s TTL)
+- [x] Dual-layer dedup on coordination subscription: ID-based (60s TTL) + content-based `${round_id}:${kind}:${speaker}` (10s TTL)
+- [x] Bot auth sign-in via `supabase.auth.signInWithPassword` using credentials from composite token
 
-Update `DyadBusOptions` to add:
-```typescript
-coordChatId?: string;       // #coordination chat UUID
-apiUrl?: string;             // e.g. https://dyadai.vercel.app
-botToken?: string;           // raw hex bot token for API auth
-botName?: string;            // e.g. "Ren"
-onCoordinationMessage?: (msg: DyadCoordinationMessage) => Promise<void>;
-```
+### 3. `src/channel.ts` -- DONE
 
-Update `DyadBusHandle` to add:
-```typescript
-sendCoordination: (content: string) => Promise<void>;
-```
+- [x] Create `CoordinationHandler` instance when coordEnabled
+- [x] Wire `onCoordinationMessage` to route through handler
+- [x] `callGateway` calls OpenClaw gateway `/v1/chat/completions` with retry + backoff
+- [x] Coordination-aware `onMessage` — holds dispatch when coordination enabled, stores in `pendingDispatches` Map
+- [x] `onDispatchDecision` callback wired to coordination handler — resolves pending dispatches (claim -> dispatch with synthesize context, defer -> skip)
+- [x] 30s fallback timeout on pending dispatches (dispatches anyway if coordination doesn't resolve)
+- [x] Native dispatch pipeline via `dispatchReplyWithBufferedBlockDispatcher` from OpenClaw SDK (~3s response time, replaced slow gateway `/v1/chat/completions` workaround)
+- [x] Cleanup on stop: clears pending dispatch timeouts, coordination handler, bus disconnect
 
-### 3. Update `src/channel.ts`
-In `gateway.startAccount`:
-- Create a `CoordinationHandler` instance
-- Wire `onCoordinationMessage` to route through the handler
-- For Layer 2 agent dialogue (AgentMessages), forward to gateway session via `runtime.channel.reply.handleInboundMessage`
-- Use `callGateway` that calls the OpenClaw gateway at `localhost:<port>` (get port from runtime or config)
+### 4. `src/config-schema.ts` -- DONE
+### 5. `src/types.ts` -- DONE
+### 6. `src/token.ts` -- DONE
+### 7. `src/types-coordination.ts` -- DONE
+### 8. `package.json` -- DONE
+### 9. `openclaw.plugin.json` -- DONE
 
-**IMPORTANT**: The gateway calls for coordination should use the OpenClaw gateway's `/v1/chat/completions` endpoint with the gateway token. The bot calls `itself` — the sidecar pattern used env vars `OPENCLAW_GATEWAY_URL` and `OPENCLAW_GATEWAY_TOKEN`. In the plugin context, we need to call the local gateway. Check if `runtime` provides a way to invoke the agent session directly (preferred) or if we need to use the gateway HTTP API.
+## Implementation Notes (Deviations from Original Plan)
 
-Actually, looking at it more carefully — the sidecar calls the gateway to generate coordination responses (proposals, intents, counter-decisions). In the plugin context, we can use `runtime.channel.reply.handleInboundMessage` for human messages, but for coordination protocol prompts (which are internal), we may need to use `runtime.system.enqueueSystemEvent` or call the gateway HTTP API. 
+### sendCoordination: Direct Supabase insert, not API route
+The original plan called for posting coordination messages via the Dyad API (`POST /api/v2/bot/message`). In practice, this had workspace_id validation issues. The implemented solution uses **direct Supabase insert** — the bot signs in via `supabase.auth.signInWithPassword` using credentials embedded in the composite token, so RLS allows it to insert as a chat member. This is faster and more reliable.
 
-**Simplest approach for MVP**: Store the gateway URL + token in config (or derive from runtime), and call `/v1/chat/completions` like the sidecar does. This keeps coordination prompt handling identical to the sidecar.
+### Dispatch pipeline: Native SDK, not gateway HTTP
+The original plan used the OpenClaw gateway's `/v1/chat/completions` endpoint to generate responses to human messages. The implemented solution uses `dispatchReplyWithBufferedBlockDispatcher` from the OpenClaw SDK — a native dispatch pipeline that runs the agent in-process. This cut response latency from ~8-10s to ~3s. The gateway HTTP endpoint is still used for coordination LLM calls (proposals, intents, counter-decisions) which go through the `:coord` session.
 
-### 4. Update `src/config-schema.ts`
-Add fields to the Zod schema:
-```typescript
-coordChatId: z.string().uuid().optional(),  // #coordination channel UUID
-apiUrl: z.string().url().optional(),         // Dyad API URL
-botToken: z.string().optional(),             // Raw hex bot token
-botName: z.string().optional(),              // Agent display name
-gatewayUrl: z.string().optional(),           // Local gateway URL (e.g. http://localhost:18789)
-gatewayToken: z.string().optional(),         // Gateway auth token
-```
+### Dedup: Dual-layer, not single-layer
+The original plan assumed single ID-based dedup would suffice. In testing, Supabase Realtime was observed sending multiple notification IDs for the same INSERT (e.g., 5x in 2ms). The implemented solution uses dual-layer dedup on both the message and coordination subscriptions:
+- Layer 1: ID-based (60s TTL) — catches exact row re-delivery
+- Layer 2: Content-based (5-10s TTL) — catches different notification IDs for the same INSERT
 
-### 5. Update `src/types.ts`
-Add new fields to `DyadAccountConfig` and `ResolvedDyadAccount`:
-```typescript
-// DyadAccountConfig
-coordChatId?: string;
-apiUrl?: string;
-botToken?: string;
-botName?: string;
-gatewayUrl?: string;
-gatewayToken?: string;
+### Pending dispatch pattern (new, not in original plan)
+When coordination is enabled, `onMessage` in channel.ts does not dispatch immediately. Instead, it stores a pending dispatch keyed by messageId, and the coordination handler resolves it via the `onDispatchDecision` callback after negotiation completes. A 30s fallback timeout ensures dispatch always happens even if coordination stalls.
 
-// ResolvedDyadAccount
-coordChatId: string;
-apiUrl: string;
-botToken: string;
-botName: string;
-gatewayUrl: string;
-gatewayToken: string;
-```
+### triggerMessageId tracking (new, not in original plan)
+`round_start` messages include a `trigger_message_id` field that links the coordination round back to the original human message. This is threaded through `RoundState` and included in the `DispatchDecision` so channel.ts can match coordination outcomes to pending dispatches.
 
-### 6. Update `src/token.ts`
-Add `apiUrl` field to the token (optional, with default):
-```typescript
-// DyadBotToken
-apiUrl?: string;  // Dyad API URL (default: https://dyadai.vercel.app)
-```
+## Gateway Communication Pattern (Coordination LLM Calls)
 
-### 7. New file: `src/types-coordination.ts`
-Define coordination-specific types (adapted from dyadai-repo):
-```typescript
-export const COORDINATION_PROTOCOL_VERSION = "1.0";
-export const MAX_COORDINATION_DEPTH = 6;
-
-export interface Proposal {
-  angle: string;
-  covers: string[];
-  defers: string[];
-}
-
-export interface ParsedCoordinationMessage {
-  id: string;
-  speaker: string;
-  content: string;
-  parsed: any;
-  messageType: string;
-}
-```
-
-### 8. Update `package.json`
-Add dependency:
-```json
-"@supabase/supabase-js": "^2.45.0"
-```
-
-### 9. Update `openclaw.plugin.json`
-Ensure configSchema includes the new fields.
-
-## Gateway Communication Pattern
-
-For coordination (generating proposals, intents, counter-decisions), the plugin needs to call the OpenClaw gateway. In the sidecar, this was:
+Coordination LLM calls (proposals, intents, counter-decisions) use the OpenClaw gateway HTTP API, same as the sidecar did:
 
 ```typescript
-fetch(`${GW_URL}/v1/chat/completions`, {
+fetch(`${gatewayUrl}/v1/chat/completions`, {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GW_TOKEN}` },
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${gatewayToken}` },
   body: JSON.stringify({
     model: 'openclaw:main',
     user: 'dyad:coord',
@@ -167,31 +119,19 @@ fetch(`${GW_URL}/v1/chat/completions`, {
 });
 ```
 
-In the plugin, we should replicate this pattern using the configured `gatewayUrl` and `gatewayToken`. The coordination prompts are internal (not user-facing) so they go through the `:coord` session.
+The coordination prompts are internal (not user-facing) so they go through the `:coord` session. Retry with exponential backoff is included (1 retry, 2x timeout on retry).
 
-## What NOT to Change
+## What Was NOT Changed
 - `index.ts` — already correct
 - `runtime.ts` — already correct
-- `openclaw.plugin.json` basic structure — keep as is
+- `openclaw.plugin.json` basic structure — kept as is
 
-## Testing Strategy
-After implementation:
-1. Install the plugin: symlink to `~/.openclaw/extensions/dyad`
-2. Add config to `openclaw.yaml`:
-   ```yaml
-   channels:
-     dyad:
-       token: <base64 bot token>
-       coordChatId: "579e7f34-0b30-4551-aa57-f5f479507270"
-       apiUrl: "https://dyadai.vercel.app"
-       botToken: "23fa6686aa9db565c085ebfacfe61e53c2188a8fb8bc61e7"
-       botName: "Ren"
-       gatewayUrl: "http://localhost:18789"
-       gatewayToken: "ef8d6895..."
-   ```
-3. Restart OpenClaw gateway
-4. Verify: send message in Dyad → agent responds
-5. Verify: coordination round fires → intents flow
+## Testing (Verified)
+1. Plugin installed via path in `openclaw.yaml` `plugins.load.paths`
+2. Config in `openclaw.yaml` under `channels.dyad`
+3. Verified: human messages dispatch and respond (~3s via native pipeline)
+4. Verified: coordination rounds fire, proposals/accept/ready flow correctly
+5. Verified: dispatch decisions resolve pending dispatches (claim -> respond, defer -> skip)
 
 ## File Structure (Final)
 ```
@@ -213,5 +153,7 @@ dyad-channel/
     └── types-coordination.ts   # NEW: Coordination type definitions
 ```
 
-## Priority
-This is the highest priority task — Joshua wants it built tonight for the Betaworks demo tomorrow.
+## Status History
+- **Original priority**: Highest — built for Betaworks demo.
+- **Completed**: All items implemented across multiple sessions.
+- **Sidecar status**: `lib/coordination/sidecar.ts` in dyadai-repo is now dead code, replaced by this plugin.
