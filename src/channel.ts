@@ -290,7 +290,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             return;
           }
           seenMsgContent.add(msgKey);
-          setTimeout(() => seenMsgContent.delete(msgKey), 600_000); // 10 min — must survive reconnection replays
+          setTimeout(() => seenMsgContent.delete(msgKey), 30_000); // 30s — catch ~8ms duplicate rows, not reconnection replays (ID dedup handles those)
 
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
