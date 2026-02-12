@@ -12,6 +12,7 @@ import {
   type ResolvedDyadAccount,
 } from "./types.js";
 import { createCoordinationHandler, type CoordinationHandler } from "./coordination.js";
+import { COORDINATION_PROTOCOL_VERSION } from "./types-coordination.js";
 import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
@@ -261,6 +262,34 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // these because each row has a unique ID.
       const seenMsgContent = new Set<string>();
 
+      // --- Post to coordination channel (shared by onMessage + coordination handler) ---
+      // Uses the API route which has service role client → bypasses RLS.
+      // Direct Supabase inserts require bot workspace membership which isn't guaranteed.
+      async function postToCoordination(content: string): Promise<void> {
+        try {
+          const res = await fetch(`${account.apiUrl}/api/v2/bot/message`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${account.apiBotToken}`,
+            },
+            body: JSON.stringify({
+              chat_id: account.coordChatId,
+              content,
+              message_type: "bot_coordination",
+            }),
+          });
+          if (!res.ok) {
+            const text = await res.text().catch(() => "");
+            ctx.log?.error(
+              `${tag} Post to coordination HTTP ${res.status}: ${text.slice(0, 200)}`,
+            );
+          }
+        } catch (e: any) {
+          ctx.log?.error(`${tag} Post to coordination failed: ${e.message}`);
+        }
+      }
+
       // Set after bus is created (needs bus.sendMessage). The wrapper ensures
       // callers always go through the current implementation even if captured early.
       let doDispatchImpl: ((chatId: string, text: string, userId: string) => Promise<void>) | null = null;
@@ -323,7 +352,24 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             }, 30_000);
 
             pendingDispatches.set(messageId, { chatId, text, userId, timeoutId });
-            ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, waiting for round`);
+            ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, starting round`);
+
+            // Write round_start to kick off coordination negotiation.
+            // Uses messageId as roundId — deterministic, so both bots generate
+            // the same roundId for the same trigger. The coordination handler
+            // deduplicates by roundId (rounds.has()), so only one round is created per bot.
+            // Each bot's own round_start is filtered by the bus (speaker === botName),
+            // so it only triggers the OTHER bot's coordination handler.
+            postToCoordination(JSON.stringify({
+              protocol: COORDINATION_PROTOCOL_VERSION,
+              round_id: messageId,
+              trigger_message_id: messageId,
+              trigger_content: `${userId}: ${text}`,
+              intent: { type: "round_start" },
+            })).catch((err) => {
+              ctx.log?.error(`${tag} Failed to post round_start for ${messageId.slice(0, 8)}: ${err}`);
+            });
+
             return;
           }
 
@@ -413,33 +459,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         coordination = createCoordinationHandler({
           botName: account.botName,
           callGateway: (prompt, timeoutMs) => callGateway(prompt, timeoutMs),
-          // Post to coordination via API route (same pattern as the sidecar).
-          // The API route uses service role client → bypasses RLS.
-          // Direct Supabase inserts require bot auth + RLS and fail silently.
-          postToCoordination: async (content: string) => {
-            try {
-              const res = await fetch(`${account.apiUrl}/api/v2/bot/message`, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  Authorization: `Bearer ${account.apiBotToken}`,
-                },
-                body: JSON.stringify({
-                  chat_id: account.coordChatId,
-                  content,
-                  message_type: "bot_coordination",
-                }),
-              });
-              if (!res.ok) {
-                const text = await res.text().catch(() => "");
-                ctx.log?.error(
-                  `${tag} Post to coordination HTTP ${res.status}: ${text.slice(0, 200)}`,
-                );
-              }
-            } catch (e: any) {
-              ctx.log?.error(`${tag} Post to coordination failed: ${e.message}`);
-            }
-          },
+          postToCoordination,
           onDispatchDecision: async ({ triggerMessageId, shouldRespond, synthesizeContext }) => {
             if (!triggerMessageId) {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
