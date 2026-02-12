@@ -58,7 +58,7 @@ export interface CoordinationHandlerOpts {
 
 const ROUND_TIMEOUT_MS = 12000;
 const ROUND_CLEANUP_MS = 30000;
-const SEEN_TTL_MS = 60000;
+const SEEN_TTL_MS = 720_000; // 12 min — must exceed staleness watchdog (10 min) to survive reconnection replays
 
 // ============================================================================
 // Factory
@@ -85,7 +85,10 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
   const seenMessageIds = new Set<string>();
 
   function isDuplicate(messageId: string): boolean {
-    if (!messageId) return false;
+    if (!messageId) {
+      log.warn("Message with empty ID — treating as duplicate to be safe");
+      return true;
+    }
     if (seenMessageIds.has(messageId)) return true;
     seenMessageIds.add(messageId);
     setTimeout(() => seenMessageIds.delete(messageId), SEEN_TTL_MS);
@@ -100,9 +103,38 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     return false;
   }
 
+  // --- Write-side dedup: tracks stimuli we've already responded to ---
+  // Keyed on stimulus content (speaker + content hash), not response content
+  // (which varies per LLM call). Prevents replayed messages from triggering
+  // duplicate responses after reconnection.
+  const RESPONDED_TTL_MS = 600_000; // 10 min
+  const respondedTo = new Set<string>();
+
+  function alreadyRespondedTo(speaker: string, content: string): boolean {
+    const key = `${speaker}:${content.slice(0, 120)}`;
+    if (respondedTo.has(key)) return true;
+    respondedTo.add(key);
+    setTimeout(() => respondedTo.delete(key), RESPONDED_TTL_MS);
+    return false;
+  }
+
   // --- Layer 2 concurrency guard (prevents gateway saturation) ---
   const MAX_LAYER2_INFLIGHT = 2;
   let layer2Inflight = 0;
+
+  /** Guarded gateway call for Layer 2 — returns null if at capacity or on error. */
+  async function callGatewayGuarded(prompt: string, timeoutMs: number): Promise<string | null> {
+    if (layer2Inflight >= MAX_LAYER2_INFLIGHT) {
+      log.warn(`Layer 2 call dropped — ${layer2Inflight} already in flight`);
+      return null;
+    }
+    layer2Inflight++;
+    try {
+      return await callGateway(prompt, timeoutMs);
+    } finally {
+      layer2Inflight--;
+    }
+  }
 
   // --- Response validation ---
   const ERROR_PATTERNS = [
@@ -129,7 +161,7 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
         s
           .toLowerCase()
           .split(/\s+/)
-          .filter((w) => w.length > 2),
+          .filter((w) => w.length > 1),
       );
     const overlapping: string[] = [];
 
@@ -214,7 +246,16 @@ Either accept as-is or revise your covers to avoid overlap:
     }
   }
 
-  async function generateFinalIntent(round: RoundState): Promise<any> {
+  interface FinalIntent {
+    type: "claim" | "synthesize" | "defer" | "abstain";
+    scope?: string;
+    with?: string;
+    to?: string;
+    reason?: string;
+    topic?: string;
+  }
+
+  async function generateFinalIntent(round: RoundState): Promise<FinalIntent> {
     const otherContext =
       round.otherName && round.otherProposal
         ? `\n${round.otherName}'s angle: "${round.otherProposal.angle}", covers: [${round.otherProposal.covers.join(", ")}]`
@@ -252,7 +293,7 @@ Choose ONE:
     round.phase = "locked";
     clearTimeout(round.timeoutId);
 
-    const intent = await generateFinalIntent(round);
+    const intent: FinalIntent = await generateFinalIntent(round);
 
     const summary = round.otherName
       ? `${botName}: ${round.myProposal.angle} (${round.myProposal.covers.join(", ")}), ${round.otherName}: ${round.otherProposal?.angle || "unspecified"} (${round.otherProposal?.covers.join(", ") || ""})`
@@ -272,7 +313,7 @@ Choose ONE:
     log.info(`READY (LOCKED): intent=${intent?.type || "claim"}, summary="${summary}"`);
 
     // Signal dispatch decision — plugin uses this to dispatch or suppress
-    const finalIntent = intent || { type: "claim" as const, scope: round.myProposal.angle };
+    const finalIntent: FinalIntent = intent || { type: "claim", scope: round.myProposal.angle };
     const shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
 
     if (opts.onDispatchDecision) {
@@ -329,9 +370,6 @@ Choose ONE:
       timeoutId,
     });
 
-    // Cleanup after 30s
-    setTimeout(() => rounds.delete(roundId), ROUND_CLEANUP_MS);
-
     const proposal = await generateProposal(parsed);
     if (!proposal) {
       log.error("Failed to generate proposal — skipping round");
@@ -339,6 +377,10 @@ Choose ONE:
       clearTimeout(timeoutId);
       return;
     }
+
+    // Cleanup timer starts AFTER proposal generation so slow proposals
+    // don't race with the 30s window
+    setTimeout(() => rounds.delete(roundId), ROUND_CLEANUP_MS);
 
     // Update round state with actual proposal
     const round = rounds.get(roundId);
@@ -551,58 +593,54 @@ Choose ONE:
         return;
       }
 
-      // Drop if too many Layer 2 gateway calls in flight (prevents queue saturation)
-      if (layer2Inflight >= MAX_LAYER2_INFLIGHT) {
-        log.warn(`AgentMessage from ${speaker} dropped — ${layer2Inflight} Layer 2 calls in flight`);
-        return;
-      }
-
       const prefix = parsed.to === botName ? `[${speaker} to you` : `[${speaker}`;
       const kindLabel =
         parsed.kind === "question" ? "asks" : parsed.kind === "flag" ? "flags" : "says";
       const depth = parsed.depth || 0;
+
+      // Write-side dedup: skip if we've already responded to this stimulus
+      if (alreadyRespondedTo(speaker, parsed.content || "")) {
+        log.info(`AgentMessage from ${speaker} skipped — already responded to this stimulus`);
+        return;
+      }
+
       log.info(
         `AgentMessage from ${speaker}: ${parsed.kind} (depth=${depth}) — ${parsed.content?.slice(0, 80)}`,
       );
 
-      layer2Inflight++;
-      try {
-        const response = await callGateway(`${prefix} ${kindLabel}]: ${parsed.content}`, 30000);
+      const response = await callGatewayGuarded(`${prefix} ${kindLabel}]: ${parsed.content}`, 30000);
 
-        // Post reply back to #coordination if expects_reply and under depth cap
-        if (
-          isValidResponse(response) &&
-          parsed.expects_reply !== false &&
-          depth < MAX_COORDINATION_DEPTH
-        ) {
-          await postToCoordination(
-            JSON.stringify({
-              protocol: COORDINATION_PROTOCOL_VERSION,
-              kind: "inform",
-              to: speaker,
-              topic: parsed.topic || undefined,
-              content: response,
-              expects_reply: depth + 1 < MAX_COORDINATION_DEPTH - 1,
-              depth: depth + 1,
-            }),
-          );
-          log.info(`Reply posted (depth=${depth + 1}, ${response.length} chars)`);
-        } else if (!isValidResponse(response)) {
-          log.info("Empty/error gateway response — not posting reply");
-        } else {
-          log.info(`Response not posted (depth=${depth} >= cap or no reply expected)`);
-        }
-      } finally {
-        layer2Inflight--;
+      // Post reply back to #coordination if expects_reply and under depth cap
+      if (
+        isValidResponse(response) &&
+        parsed.expects_reply !== false &&
+        depth < MAX_COORDINATION_DEPTH
+      ) {
+        await postToCoordination(
+          JSON.stringify({
+            protocol: COORDINATION_PROTOCOL_VERSION,
+            kind: "inform",
+            to: speaker,
+            topic: parsed.topic || undefined,
+            content: response,
+            expects_reply: depth + 1 < MAX_COORDINATION_DEPTH - 1,
+            depth: depth + 1,
+          }),
+        );
+        log.info(`Reply posted (depth=${depth + 1}, ${response.length} chars)`);
+      } else if (!isValidResponse(response)) {
+        log.info("Empty/error gateway response — not posting reply");
+      } else {
+        log.info(`Response not posted (depth=${depth} >= cap or no reply expected)`);
       }
       return;
     }
 
-    // Resolution signals
+    // Resolution signals (context injection — response discarded intentionally)
     if (parsed?.kind === "resolution") {
       log.info(`${speaker} ${parsed.signal}: ${parsed.summary || ""}`);
       if (!hasActiveRound()) {
-        await callGateway(
+        await callGatewayGuarded(
           `[${speaker} signals ${parsed.signal}${parsed.summary ? `: ${parsed.summary}` : ""}]`,
           30000,
         );
@@ -618,9 +656,15 @@ Choose ONE:
       }
 
       const depth = parsed.depth || 0;
+
+      if (alreadyRespondedTo(speaker, parsed.content || "")) {
+        log.info(`Negotiate from ${speaker} skipped — already responded to this stimulus`);
+        return;
+      }
+
       log.info(`${speaker} negotiating (depth=${depth}): ${parsed.content?.slice(0, 80)}`);
 
-      const response = await callGateway(
+      const response = await callGatewayGuarded(
         `[Coordination — ${speaker}]: ${parsed.content}`,
         30000,
       );
@@ -645,7 +689,7 @@ Choose ONE:
     // Any other structured protocol message -> forward as context (skip during active rounds)
     if (parsed && parsed.protocol === COORDINATION_PROTOCOL_VERSION) {
       if (!hasActiveRound()) {
-        await callGateway(
+        await callGatewayGuarded(
           `[Coordination from ${speaker}]: ${JSON.stringify(parsed).slice(0, 300)}`,
           30000,
         );
@@ -656,7 +700,7 @@ Choose ONE:
     // Unparseable free-form message
     if (!parsed) {
       if (!hasActiveRound()) {
-        await callGateway(`[Coordination from ${speaker}]: ${msg.content}`, 30000);
+        await callGatewayGuarded(`[Coordination from ${speaker}]: ${msg.content}`, 30000);
       }
       return;
     }
@@ -673,6 +717,7 @@ Choose ONE:
     }
     rounds.clear();
     seenMessageIds.clear();
+    respondedTo.clear();
   }
 
   return {

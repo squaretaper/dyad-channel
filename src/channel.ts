@@ -17,6 +17,8 @@ import { getDyadRuntime } from "./runtime.js";
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
   id: "dyad",
   meta: {
@@ -69,12 +71,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
   messaging: {
     normalizeTarget: (target) => target.trim(),
     targetResolver: {
-      looksLikeId: (input) => {
-        // UUID format check for chat IDs
-        return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-          input.trim(),
-        );
-      },
+      looksLikeId: (input) => UUID_RE.test(input.trim()),
       hint: "<chat_id (UUID)>",
     },
   },
@@ -92,8 +89,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // Guard: only deliver to valid chat UUIDs.
       // The gateway may route callGateway responses (coordination LLM calls)
       // through outbound — those use non-UUID targets like "dyad:coord:*".
-      // Silently skip to prevent coordination JSON from appearing as chat messages.
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(to)) {
+      if (!UUID_RE.test(to)) {
+        // No logger available at plugin level — non-UUID targets are expected
+        // from coordination gateway routing and silently skipped.
         return { channel: "dyad" as const, messageId: "", to };
       }
 
@@ -172,6 +170,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       const MAX_CONCURRENT_GATEWAY_CALLS = 3;
       let activeGatewayCalls = 0;
       const gatewayQueue: Array<() => void> = [];
+      let gatewayStopped = false;
 
       async function callGateway(
         prompt: string,
@@ -183,6 +182,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           if (activeGatewayCalls >= MAX_CONCURRENT_GATEWAY_CALLS) {
             await new Promise<void>(resolve => gatewayQueue.push(resolve));
           }
+          if (gatewayStopped) return null;
           activeGatewayCalls++;
           try {
             const thisTimeout = attempt === 0 ? timeoutMs : timeoutMs * 2;
@@ -205,12 +205,19 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               signal: AbortSignal.timeout(thisTimeout),
             });
 
-            const result = await res.json();
-            const content = result?.choices?.[0]?.message?.content?.trim() || null;
-            if (content) return content;
-            ctx.log?.warn(
-              `${tag} Gateway returned empty (attempt ${attempt + 1}/${retries + 1})`,
-            );
+            if (!res.ok) {
+              const errBody = await res.text().catch(() => "");
+              ctx.log?.error(
+                `${tag} Gateway HTTP ${res.status} (attempt ${attempt + 1}/${retries + 1}): ${errBody.slice(0, 200)}`,
+              );
+            } else {
+              const result = await res.json();
+              const content = result?.choices?.[0]?.message?.content?.trim() || null;
+              if (content) return content;
+              ctx.log?.warn(
+                `${tag} Gateway returned empty (attempt ${attempt + 1}/${retries + 1})`,
+              );
+            }
           } catch (e: any) {
             ctx.log?.error(
               `${tag} Gateway call failed (attempt ${attempt + 1}/${retries + 1}): ${e.message}`,
@@ -249,8 +256,20 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // two coordination rounds that both resolve → double dispatch → dropped reply.
       const dispatched = new Set<string>();
 
-      // Will be set after bus is created (needs bus.sendMessage)
-      let doDispatch: (chatId: string, text: string, userId: string) => Promise<void>;
+      // Content-based dedup for onMessage — catches duplicate DB rows (different IDs,
+      // same content) that Supabase inserts ~8ms apart. The bus ID-based dedup misses
+      // these because each row has a unique ID.
+      const seenMsgContent = new Set<string>();
+
+      // Set after bus is created (needs bus.sendMessage). The wrapper ensures
+      // callers always go through the current implementation even if captured early.
+      let doDispatchImpl: ((chatId: string, text: string, userId: string) => Promise<void>) | null = null;
+      const doDispatch = (chatId: string, text: string, userId: string): Promise<void> => {
+        if (!doDispatchImpl) {
+          return Promise.reject(new Error("doDispatch called before initialization"));
+        }
+        return doDispatchImpl(chatId, text, userId);
+      };
 
       // Start bus with coordination opts wired in
       ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
@@ -263,13 +282,22 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         botPassword: account.botPassword,
         botDisplayName: account.botName,
         onMessage: async ({ chatId, text, userId, messageId }) => {
+          // Content-based dedup: Supabase sometimes inserts duplicate rows (~8ms apart)
+          // with different IDs but identical content. Catch them here.
+          const msgKey = `${chatId}:${userId}:${text.slice(0, 80)}`;
+          if (seenMsgContent.has(msgKey)) {
+            ctx.log?.warn(`${tag} Content dedup: skipped duplicate for ${messageId.slice(0, 8)}`);
+            return;
+          }
+          seenMsgContent.add(msgKey);
+          setTimeout(() => seenMsgContent.delete(msgKey), 600_000); // 10 min — must survive reconnection replays
+
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
           // Coordination-aware dispatch: if coordination is active, hold dispatch
           // and let the coordination handler decide based on negotiation outcome.
           if (coordEnabled && coordination) {
-            // Guard: duplicate Realtime INSERTs arrive ~4ms apart with different
-            // notification IDs but the same messageId. Skip if already pending or dispatched.
+            // Guard: skip if this exact messageId is already pending or dispatched.
             if (pendingDispatches.has(messageId)) {
               ctx.log?.warn(`${tag} Duplicate onMessage for ${messageId.slice(0, 8)} — already pending, skipping`);
               return;
@@ -279,7 +307,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               return;
             }
 
-            const timeoutId = setTimeout(async () => {
+            const timeoutId = setTimeout(() => {
               const pending = pendingDispatches.get(messageId);
               if (pending) {
                 pendingDispatches.delete(messageId);
@@ -288,7 +316,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 dispatched.add(messageId);
                 setTimeout(() => dispatched.delete(messageId), 60_000);
                 ctx.log?.warn(`${tag} Coordination timeout for ${messageId.slice(0, 8)} — dispatching fallback`);
-                await doDispatch(chatId, text, userId);
+                doDispatch(chatId, text, userId).catch((err) => {
+                  ctx.log?.error(`${tag} Fallback dispatch failed for ${messageId.slice(0, 8)}: ${err.message}`);
+                });
               }
             }, 30_000);
 
@@ -326,7 +356,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       });
 
       // --- Native dispatch helper (uses bus.sendMessage for delivery) ---
-      doDispatch = async (chatId: string, text: string, userId: string) => {
+      doDispatchImpl = async (chatId: string, text: string, userId: string) => {
         try {
           const rt = getDyadRuntime();
           ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
@@ -472,7 +502,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           pendingDispatches.clear();
           dispatched.clear();
 
-          // Drain gateway concurrency semaphore
+          // Drain gateway concurrency semaphore — stopped flag prevents resumed calls
+          gatewayStopped = true;
           activeGatewayCalls = 0;
           for (const resolve of gatewayQueue) resolve();
           gatewayQueue.length = 0;

@@ -156,6 +156,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Dedup for messages — dual-layer: ID-based + content-based
   // ID-based catches exact row re-delivery. Content-based catches cases where
   // Supabase sends different notification IDs for the same INSERT (observed: 5x in 2ms).
+  // TTLs must exceed STALE_THRESHOLD_MS (10 min) to survive reconnection replays.
+  const DEDUP_TTL_MS = 720_000; // 12 min — covers staleness watchdog + reconnect delay
+  const DEDUP_CONTENT_TTL_MS = 600_000; // 10 min — content-based (slightly shorter)
   const seenMessageIds = new Set<string>();
   const seenContentKeys = new Set<string>();
   const seenCoordIds = new Set<string>();
@@ -200,7 +203,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
             seenMessageIds.add(msg.id);
-            setTimeout(() => seenMessageIds.delete(msg.id), 60_000);
+            setTimeout(() => seenMessageIds.delete(msg.id), DEDUP_TTL_MS);
 
             // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
             const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
@@ -209,7 +212,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
             seenContentKeys.add(contentKey);
-            setTimeout(() => seenContentKeys.delete(contentKey), 5_000);
+            setTimeout(() => seenContentKeys.delete(contentKey), DEDUP_CONTENT_TTL_MS);
 
             await onMessage({
               chatId: msg.chat_id,
@@ -270,7 +273,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
             // Dedup layer 1: ID-based
             if (seenCoordIds.has(msg.id)) return;
             seenCoordIds.add(msg.id);
-            setTimeout(() => seenCoordIds.delete(msg.id), 60_000);
+            setTimeout(() => seenCoordIds.delete(msg.id), DEDUP_TTL_MS);
 
             // Parse content (needed for dedup key extraction)
             let parsed: any = null;
@@ -287,7 +290,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               : `${msg.speaker}:${(msg.content || "").slice(0, 80)}`;
             if (seenCoordContentKeys.has(coordKey)) return;
             seenCoordContentKeys.add(coordKey);
-            setTimeout(() => seenCoordContentKeys.delete(coordKey), 10_000);
+            setTimeout(() => seenCoordContentKeys.delete(coordKey), DEDUP_CONTENT_TTL_MS);
 
             await onCoordinationMessage({
               id: msg.id,

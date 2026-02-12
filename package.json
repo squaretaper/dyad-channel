@@ -15,9 +15,6 @@
     "typescript": "^5.7.0"
   },
   "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ],
     "channel": {
       "id": "dyad",
       "label": "Dyad",
