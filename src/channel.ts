@@ -257,6 +257,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // two coordination rounds that both resolve → double dispatch → dropped reply.
       const dispatched = new Set<string>();
 
+      // Synchronous messageId guard — catches ANY duplicate delivery regardless of cause.
+      // Must be checked as the absolute first thing in onMessage, before any other logic.
+      const processedMessageIds = new Set<string>();
+
       // Content-based dedup for onMessage — catches duplicate DB rows (different IDs,
       // same content) that Supabase inserts ~8ms apart. The bus ID-based dedup misses
       // these because each row has a unique ID.
@@ -311,15 +315,26 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         botPassword: account.botPassword,
         botDisplayName: account.botName,
         onMessage: async ({ chatId, text, userId, messageId }) => {
-          // Content-based dedup: Supabase sometimes inserts duplicate rows (~8ms apart)
-          // with different IDs but identical content. Catch them here.
+          // Absolute first guard — synchronous messageId check. Catches any duplicate
+          // delivery regardless of cause (multiple Realtime events, reconnection replays,
+          // duplicate DB rows with same ID). Set.has() + Set.add() is atomic in
+          // single-threaded JS — no event can slip between check and add.
+          if (processedMessageIds.has(messageId)) {
+            ctx.log?.warn(`${tag} MessageId dedup: skipped ${messageId.slice(0, 8)}`);
+            return;
+          }
+          processedMessageIds.add(messageId);
+          setTimeout(() => processedMessageIds.delete(messageId), 600_000); // 10 min
+
+          // Content-based dedup: catches duplicate DB rows (~8ms apart) with
+          // DIFFERENT IDs but identical content.
           const msgKey = `${chatId}:${userId}:${text.slice(0, 80)}`;
           if (seenMsgContent.has(msgKey)) {
             ctx.log?.warn(`${tag} Content dedup: skipped duplicate for ${messageId.slice(0, 8)}`);
             return;
           }
           seenMsgContent.add(msgKey);
-          setTimeout(() => seenMsgContent.delete(msgKey), 30_000); // 30s — catch ~8ms duplicate rows, not reconnection replays (ID dedup handles those)
+          setTimeout(() => seenMsgContent.delete(msgKey), 30_000);
 
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
@@ -354,21 +369,36 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             pendingDispatches.set(messageId, { chatId, text, userId, timeoutId });
             ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, starting round`);
 
-            // Write round_start to kick off coordination negotiation.
-            // Uses messageId as roundId — deterministic, so both bots generate
-            // the same roundId for the same trigger. The coordination handler
-            // deduplicates by roundId (rounds.has()), so only one round is created per bot.
-            // Each bot's own round_start is filtered by the bus (speaker === botName),
-            // so it only triggers the OTHER bot's coordination handler.
-            postToCoordination(JSON.stringify({
+            // Write round_start to coordination chat (for the OTHER bot to see via Realtime).
+            // Uses messageId as roundId — deterministic dedup across bots.
+            const roundStartPayload = {
               protocol: COORDINATION_PROTOCOL_VERSION,
               round_id: messageId,
               trigger_message_id: messageId,
               trigger_content: `${userId}: ${text}`,
               intent: { type: "round_start" },
-            })).catch((err) => {
+            };
+
+            postToCoordination(JSON.stringify(roundStartPayload)).catch((err) => {
               ctx.log?.error(`${tag} Failed to post round_start for ${messageId.slice(0, 8)}: ${err}`);
             });
+
+            // Also process round_start locally — bypasses Realtime subscription so
+            // coordination starts even if the subscription is dead (CHANNEL_ERROR).
+            // The bus filters out own messages (speaker === botName), so this bot
+            // would never see its own round_start via Realtime. Direct invocation
+            // ensures the round always starts.
+            if (coordination) {
+              coordination.handleMessage({
+                id: `local-${messageId}`,
+                speaker: "system",
+                content: JSON.stringify(roundStartPayload),
+                parsed: roundStartPayload,
+                messageType: "bot_coordination",
+              }).catch((err) => {
+                ctx.log?.error(`${tag} Local round_start processing failed: ${err}`);
+              });
+            }
 
             return;
           }
