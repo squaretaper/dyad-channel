@@ -234,19 +234,19 @@ export function createCoordHistoryTool(): ToolFactory {
               } else if (parsed.kind === "ready") {
                 summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 100)}"`;
               } else if (parsed.kind === "response_summary") {
-                summary = `[response_summary] "${(parsed.content || "").slice(0, 150)}"`;
+                summary = `[response_summary] "${(parsed.content || "").slice(0, 1000)}"`;
               } else if (
                 ["question", "inform", "flag", "delegate", "status"].includes(
                   parsed.kind,
                 )
               ) {
                 const toLabel = parsed.to ? ` → ${parsed.to}` : "";
-                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 200)}`;
+                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 1000)}`;
               } else {
-                summary = msg.content.slice(0, 200);
+                summary = msg.content.slice(0, 1000);
               }
             } catch {
-              summary = msg.content.slice(0, 200);
+              summary = msg.content.slice(0, 1000);
             }
 
             return `${msg.speaker} (${ts}): ${summary}`;
