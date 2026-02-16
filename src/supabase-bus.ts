@@ -48,6 +48,7 @@ export interface DyadBusOptions {
     text: string;
     userId: string;
     messageId: string;
+    speaker: string;
   }) => Promise<void>;
   /** Called on errors */
   onError: (error: Error, context: string) => void;
@@ -219,6 +220,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               text: msg.content ?? "",
               userId: msg.user_id,
               messageId: msg.id,
+              speaker: msg.speaker ?? "",
             });
           } catch (err) {
             onError(err as Error, "handle message");

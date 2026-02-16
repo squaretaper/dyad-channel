@@ -314,7 +314,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         botEmail: account.botEmail,
         botPassword: account.botPassword,
         botDisplayName: account.botName,
-        onMessage: async ({ chatId, text, userId, messageId }) => {
+        onMessage: async ({ chatId, text, userId, messageId, speaker }) => {
           // Absolute first guard — synchronous messageId check. Catches any duplicate
           // delivery regardless of cause (multiple Realtime events, reconnection replays,
           // duplicate DB rows with same ID). Set.has() + Set.add() is atomic in
@@ -375,7 +375,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               protocol: COORDINATION_PROTOCOL_VERSION,
               round_id: messageId,
               trigger_message_id: messageId,
-              trigger_content: `${userId}: ${text}`,
+              trigger_content: `${speaker || userId}: ${text}`,
               source_chat_id: chatId,
               intent: { type: "round_start" },
             };
