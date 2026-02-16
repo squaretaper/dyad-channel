@@ -75,6 +75,7 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     otherName?: string;
     triggerContent: string;
     triggerMessageId: string | null;
+    sourceChatId: string | null;
     roundId: string;
     timeoutId: ReturnType<typeof setTimeout>;
   }
@@ -182,13 +183,15 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
   // --- Gateway prompt helpers ---
 
   async function generateProposal(roundStart: any): Promise<Proposal | null> {
-    const prompt = `[COORDINATION — propose your contribution. Respond with JSON only, no other text]
+    const prompt = `[COORDINATION — assess and propose. Respond with JSON only, no other text]
 Message from user: "${(roundStart.trigger_content || "").slice(0, 500)}"
 
-What unique angle would you bring? Respond with structured proposal:
-{"angle": "<high-level label>", "covers": ["<topic 1>", "<topic 2>"], "defers": ["<topic you leave to other agent>"]}
+First assess: does this message benefit from multiple agent perspectives, or would a single focused response be better?
 
-Example: {"angle": "protocol design", "covers": ["negotiation flow", "resolution signals"], "defers": ["Supabase implementation"]}`;
+Respond with a structured proposal:
+{"angle": "<your angle>", "covers": ["<topic 1>", ...], "defers": ["<topics for other agent>"], "solo_sufficient": <true if one good response would fully address this>}
+
+If solo_sufficient is true, still propose your angle — but be prepared to defer if the other agent's angle is stronger.`;
 
     const content = await callGateway(prompt, 15000);
     if (!content) return null;
@@ -201,6 +204,7 @@ Example: {"angle": "protocol design", "covers": ["negotiation flow", "resolution
         angle: parsed.angle || content.slice(0, 100),
         covers: Array.isArray(parsed.covers) ? parsed.covers : [],
         defers: Array.isArray(parsed.defers) ? parsed.defers : [],
+        solo_sufficient: parsed.solo_sufficient === true,
       };
     } catch {
       return { angle: content.slice(0, 100), covers: [], defers: [] };
@@ -261,14 +265,28 @@ Either accept as-is or revise your covers to avoid overlap:
         ? `\n${round.otherName}'s angle: "${round.otherProposal.angle}", covers: [${round.otherProposal.covers.join(", ")}]`
         : "";
 
+    const bothSoloSufficient =
+      round.myProposal.solo_sufficient &&
+      round.otherProposal?.solo_sufficient;
+    const soloNote = bothSoloSufficient
+      ? "\nBoth agents assessed that a single response would suffice."
+      : "";
+
     const prompt = `[COORDINATION — choose your final intent. Respond with JSON only, no other text]
+User message: "${round.triggerContent.slice(0, 300)}"
 Your angle: "${round.myProposal.angle}", covers: [${round.myProposal.covers.join(", ")}]${otherContext}
+${soloNote}
+
+- CLAIM: you respond from your angle
+- DEFER: the other agent's angle covers this well enough alone
+- SYNTHESIZE: both angles needed, weave together
+- ABSTAIN: not well-suited to contribute
 
 Choose ONE:
-- {"type":"claim","scope":"${round.myProposal.angle}"}
-- {"type":"synthesize","with":"${round.otherName || "other"}","topic":"<joint topic>"}
-- {"type":"defer","to":"${round.otherName || "other"}","reason":"<why>"}
-- {"type":"abstain","reason":"<why>"}`;
+- {"type":"claim","scope":"..."}
+- {"type":"defer","to":"${round.otherName || "other"}","reason":"..."}
+- {"type":"synthesize","with":"${round.otherName || "other"}","topic":"..."}
+- {"type":"abstain","reason":"..."}`;
 
     const content = await callGateway(prompt, 8000);
     if (!content) return { type: "claim", scope: round.myProposal.angle };
@@ -308,6 +326,7 @@ Choose ONE:
         my_proposal: round.myProposal,
         other_proposal: round.otherProposal || undefined,
         summary,
+        source_chat_id: round.sourceChatId || null,
       }),
     );
     log.info(`READY (LOCKED): intent=${intent?.type || "claim"}, summary="${summary}"`);
@@ -366,6 +385,7 @@ Choose ONE:
       myProposal: placeholder,
       triggerContent: parsed.trigger_content || "",
       triggerMessageId: parsed.trigger_message_id || null,
+      sourceChatId: parsed.source_chat_id || null,
       roundId,
       timeoutId,
     });
@@ -395,6 +415,7 @@ Choose ONE:
         round_id: roundId,
         kind: "propose",
         proposal,
+        source_chat_id: round?.sourceChatId || null,
       }),
     );
     log.info(
@@ -446,6 +467,7 @@ Choose ONE:
           protocol: COORDINATION_PROTOCOL_VERSION,
           round_id: roundId,
           kind: "accept",
+          source_chat_id: round.sourceChatId || null,
         }),
       );
       log.info("ACCEPT — no covers overlap (mechanical diff)");
@@ -461,6 +483,7 @@ Choose ONE:
             protocol: COORDINATION_PROTOCOL_VERSION,
             round_id: roundId,
             kind: "accept",
+            source_chat_id: round.sourceChatId || null,
           }),
         );
         log.info("ACCEPT — gateway resolved overlap");
@@ -473,6 +496,7 @@ Choose ONE:
             round_id: roundId,
             kind: "counter",
             proposal: decision.revisedProposal,
+            source_chat_id: round.sourceChatId || null,
           }),
         );
         log.info(
@@ -515,6 +539,7 @@ Choose ONE:
         protocol: COORDINATION_PROTOCOL_VERSION,
         round_id: roundId,
         kind: "accept",
+        source_chat_id: round.sourceChatId || null,
       }),
     );
     log.info("ACCEPT counter — locking");
@@ -625,6 +650,7 @@ Choose ONE:
             content: response,
             expects_reply: depth + 1 < MAX_COORDINATION_DEPTH - 1,
             depth: depth + 1,
+            source_chat_id: parsed.source_chat_id || null,
           }),
         );
         log.info(`Reply posted (depth=${depth + 1}, ${response.length} chars)`);
@@ -677,6 +703,7 @@ Choose ONE:
             content: response,
             to: speaker,
             depth: depth + 1,
+            source_chat_id: parsed.source_chat_id || null,
           }),
         );
         log.info(`Negotiate reply posted (depth=${depth + 1}, ${response.length} chars)`);

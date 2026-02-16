@@ -376,6 +376,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               round_id: messageId,
               trigger_message_id: messageId,
               trigger_content: `${userId}: ${text}`,
+              source_chat_id: chatId,
               intent: { type: "round_start" },
             };
 

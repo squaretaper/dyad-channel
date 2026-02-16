@@ -33,6 +33,11 @@ const CoordSendSchema = Type.Object({
       },
     ),
   ),
+  source_chat_id: Type.Optional(
+    Type.String({
+      description: "Chat ID this message originates from (for scoping coordination to a specific chat)",
+    }),
+  ),
 });
 
 const CoordHistorySchema = Type.Object({
@@ -45,6 +50,11 @@ const CoordHistorySchema = Type.Object({
   since: Type.Optional(
     Type.String({
       description: "ISO timestamp — only return messages after this time",
+    }),
+  ),
+  source_chat_id: Type.Optional(
+    Type.String({
+      description: "Filter to only messages from this chat ID",
     }),
   ),
 });
@@ -86,6 +96,7 @@ export function createCoordSendTool(): ToolFactory {
           content: params.message,
           expects_reply: expectsReply,
           depth: 0,
+          source_chat_id: params.source_chat_id || null,
         });
 
         try {
@@ -103,23 +114,25 @@ export function createCoordSendTool(): ToolFactory {
           });
 
           if (!res.ok) {
-            const text = await res.text().catch(() => "");
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Failed to send message: HTTP ${res.status} — ${text.slice(0, 200)}`,
+                  text: `✗ coord send failed: HTTP ${res.status}`,
                 },
               ],
               details: {},
             };
           }
 
+          const body = await res.json().catch(() => null);
+          const id = body?.id || body?.message?.id || "";
+          const idSuffix = id ? ` | id:${id.slice(0, 4)}…${id.slice(-4)}` : "";
           return {
             content: [
               {
                 type: "text" as const,
-                text: `Message sent to ${params.to} (${kind}): "${params.message.slice(0, 200)}"`,
+                text: `✓ coord → ${params.to}${idSuffix}`,
               },
             ],
             details: {},
@@ -129,7 +142,7 @@ export function createCoordSendTool(): ToolFactory {
             content: [
               {
                 type: "text" as const,
-                text: `Failed to send message: ${e.message}`,
+                text: `✗ coord send failed: ${e.message.slice(0, 80)}`,
               },
             ],
             details: {},
@@ -195,7 +208,19 @@ export function createCoordHistoryTool(): ToolFactory {
           const messages: any[] = data.messages || [];
 
           // Take only the most recent N messages
-          const recent = messages.slice(-limit);
+          let recent = messages.slice(-limit);
+
+          // Client-side filtering by source_chat_id
+          if (params.source_chat_id) {
+            recent = recent.filter((msg: any) => {
+              try {
+                const parsed = JSON.parse(msg.content);
+                return parsed.source_chat_id === params.source_chat_id;
+              } catch {
+                return false;
+              }
+            });
+          }
 
           if (recent.length === 0) {
             return {
@@ -213,10 +238,9 @@ export function createCoordHistoryTool(): ToolFactory {
           const lines = recent.map((msg: any) => {
             const ts = msg.created_at
               ? new Date(msg.created_at).toLocaleString("en-US", {
-                  month: "short",
-                  day: "numeric",
-                  hour: "numeric",
+                  hour: "2-digit",
                   minute: "2-digit",
+                  hour12: false,
                 })
               : "";
 
@@ -234,19 +258,19 @@ export function createCoordHistoryTool(): ToolFactory {
               } else if (parsed.kind === "ready") {
                 summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 100)}"`;
               } else if (parsed.kind === "response_summary") {
-                summary = `[response_summary] "${(parsed.content || "").slice(0, 1000)}"`;
+                summary = `[response_summary] "${(parsed.content || "").slice(0, 150)}"`;
               } else if (
                 ["question", "inform", "flag", "delegate", "status"].includes(
                   parsed.kind,
                 )
               ) {
                 const toLabel = parsed.to ? ` → ${parsed.to}` : "";
-                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 1000)}`;
+                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 150)}`;
               } else {
-                summary = msg.content.slice(0, 1000);
+                summary = msg.content.slice(0, 150);
               }
             } catch {
-              summary = msg.content.slice(0, 1000);
+              summary = msg.content.slice(0, 150);
             }
 
             return `${msg.speaker} (${ts}): ${summary}`;
@@ -256,7 +280,7 @@ export function createCoordHistoryTool(): ToolFactory {
             content: [
               {
                 type: "text" as const,
-                text: `Coordination history (${recent.length} messages):\n\n${lines.join("\n")}`,
+                text: `coord history (${recent.length}):\n${lines.join("\n")}`,
               },
             ],
             details: {},

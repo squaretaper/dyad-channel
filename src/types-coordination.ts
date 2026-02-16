@@ -10,6 +10,7 @@ export interface Proposal {
   angle: string;
   covers: string[];
   defers: string[];
+  solo_sufficient?: boolean;
 }
 
 export interface ParsedCoordinationMessage {
