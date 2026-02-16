@@ -38,6 +38,8 @@ export interface DispatchDecision {
   triggerMessageId: string | null;
   shouldRespond: boolean;
   synthesizeContext?: string;
+  /** When true, confirms a defer and cancels any backup timer (no dispatch needed). */
+  cancelPending?: boolean;
 }
 
 export interface CoordinationHandlerOpts {
@@ -84,6 +86,8 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     timeoutId: ReturnType<typeof setTimeout>;
     coordHistory: string;       // previous round context (loaded once per round)
     recentResponses: string;    // what other bots recently said in the main chat
+    myFinalIntent?: FinalIntent;      // stored after lockRound generates intent
+    otherFinalIntent?: FinalIntent;   // stored when other bot's READY is received
   }
 
   const rounds = new Map<string, RoundState>();
@@ -324,6 +328,7 @@ Choose ONE:
     clearTimeout(round.timeoutId);
 
     const intent: FinalIntent = await generateFinalIntent(round);
+    round.myFinalIntent = intent;
 
     const summary = round.otherName
       ? `${botName}: ${round.myProposal.angle} (${round.myProposal.covers.join(", ")}), ${round.otherName}: ${round.otherProposal?.angle || "unspecified"} (${round.otherProposal?.covers.join(", ") || ""})`
@@ -345,7 +350,24 @@ Choose ONE:
 
     // Signal dispatch decision — plugin uses this to dispatch or suppress
     const finalIntent: FinalIntent = intent || { type: "claim", scope: round.myProposal.angle };
-    const shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
+    let shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
+    let cancelPending = false;
+
+    // Both-defer detection: if we're deferring and already know the other bot's intent
+    // (their READY arrived before we locked — e.g. we locked via handleReady), check
+    // for both-defer scenario and use alphabetical tiebreaker.
+    if (!shouldRespond && round.otherFinalIntent) {
+      const otherDeferred = round.otherFinalIntent.type === "defer" || round.otherFinalIntent.type === "abstain";
+      if (otherDeferred) {
+        if (botName < (round.otherName || "")) {
+          log.warn(`Both deferred (lockRound) — ${botName} wins tiebreaker, overriding to CLAIM`);
+          shouldRespond = true;
+        } else {
+          log.info(`Both deferred (lockRound) — ${round.otherName} wins tiebreaker, confirming defer`);
+          cancelPending = true;
+        }
+      }
+    }
 
     if (opts.onDispatchDecision) {
       const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
@@ -364,6 +386,7 @@ Choose ONE:
           triggerMessageId: round.triggerMessageId,
           shouldRespond,
           synthesizeContext: synthesizeCtx,
+          cancelPending,
         });
       } catch (e: any) {
         log.error(`onDispatchDecision failed: ${e.message}`);
@@ -432,9 +455,23 @@ Choose ONE:
 
     const proposal = await generateProposal(parsed, coordHistory, recentResponses);
     if (!proposal) {
-      log.error("Failed to generate proposal — skipping round");
+      log.error("Failed to generate proposal — dispatching immediately (fail-open)");
       rounds.delete(roundId);
       clearTimeout(timeoutId);
+
+      // Fail-open: dispatch immediately when proposal generation fails.
+      // Without this, pendingDispatches would sit for 30s until the timeout fires.
+      if (opts.onDispatchDecision) {
+        try {
+          await opts.onDispatchDecision({
+            roundId,
+            triggerMessageId: parsed.trigger_message_id || null,
+            shouldRespond: true,
+          });
+        } catch (e: any) {
+          log.error(`Fail-open dispatch failed: ${e.message}`);
+        }
+      }
       return;
     }
 
@@ -594,8 +631,67 @@ Choose ONE:
 
     log.info(`${speaker} READY: ${parsed.summary || ""}`);
 
+    // Store other bot's final intent for both-defer detection
+    if (parsed.intent) {
+      round.otherFinalIntent = parsed.intent;
+    }
+
     if (round.phase !== "locked") {
       await lockRound(round);
+    } else {
+      // Already locked — check for both-defer or we-deferred-they-claimed scenarios.
+      // This branch fires for the bot that locked first (via timeout or ACCEPT)
+      // and then receives the other bot's READY afterward.
+      const myDeferred = round.myFinalIntent &&
+        (round.myFinalIntent.type === "defer" || round.myFinalIntent.type === "abstain");
+
+      if (myDeferred && parsed.intent && opts.onDispatchDecision) {
+        const otherDeferred = parsed.intent.type === "defer" || parsed.intent.type === "abstain";
+
+        if (otherDeferred) {
+          // Both deferred — tiebreaker: alphabetically first bot claims
+          if (botName < speaker) {
+            log.warn(`Both deferred (handleReady) — ${botName} wins tiebreaker, dispatching`);
+            const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
+            const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
+            try {
+              await opts.onDispatchDecision({
+                roundId: round.roundId,
+                triggerMessageId: round.triggerMessageId,
+                shouldRespond: true,
+                synthesizeContext: `[Both agents initially deferred. Responding as fallback.${historySection}${responsesSection}\nMessage: "${round.triggerContent.slice(0, 300)}"]`,
+              });
+            } catch (e: any) {
+              log.error(`Both-defer tiebreaker dispatch failed: ${e.message}`);
+            }
+          } else {
+            log.info(`Both deferred (handleReady) — ${speaker} wins tiebreaker, confirming our defer`);
+            try {
+              await opts.onDispatchDecision({
+                roundId: round.roundId,
+                triggerMessageId: round.triggerMessageId,
+                shouldRespond: false,
+                cancelPending: true,
+              });
+            } catch (e: any) {
+              log.error(`Defer confirmation failed: ${e.message}`);
+            }
+          }
+        } else {
+          // We deferred, they claimed — confirm our defer (they'll handle it)
+          log.info(`${speaker} claimed — confirming our defer`);
+          try {
+            await opts.onDispatchDecision({
+              roundId: round.roundId,
+              triggerMessageId: round.triggerMessageId,
+              shouldRespond: false,
+              cancelPending: true,
+            });
+          } catch (e: any) {
+            log.error(`Defer confirmation failed: ${e.message}`);
+          }
+        }
+      }
     }
   }
 

@@ -340,7 +340,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             return;
           }
           seenMsgContent.add(msgKey);
-          setTimeout(() => seenMsgContent.delete(msgKey), 30_000);
+          setTimeout(() => seenMsgContent.delete(msgKey), 5_000);
 
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
@@ -505,21 +505,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             loadCoordinationHistory(bus.client, account.coordChatId!, excludeRoundId),
           loadRecentResponses: (sourceChatId) =>
             loadRecentBotResponses(bus.client, sourceChatId, account.botName),
-          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext }) => {
+          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext, cancelPending }) => {
             if (!triggerMessageId) {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
               return;
             }
-
-            // Primary double-dispatch guard: synchronous check + add is atomic in
-            // single-threaded JS. If two coordination rounds both resolve for the
-            // same trigger, only the first one passes this gate.
-            if (dispatched.has(triggerMessageId)) {
-              ctx.log?.warn(`${tag} [coord] Already dispatched ${triggerMessageId.slice(0, 8)} — ignoring duplicate decision`);
-              return;
-            }
-            dispatched.add(triggerMessageId);
-            setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
 
             const pending = pendingDispatches.get(triggerMessageId);
             if (!pending) {
@@ -527,10 +517,19 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               return;
             }
 
-            clearTimeout(pending.timeoutId);
-            pendingDispatches.delete(triggerMessageId);
-
             if (shouldRespond) {
+              // Double-dispatch guard: only for positive decisions. Synchronous
+              // check + add is atomic in single-threaded JS.
+              if (dispatched.has(triggerMessageId)) {
+                ctx.log?.warn(`${tag} [coord] Already dispatched ${triggerMessageId.slice(0, 8)} — ignoring duplicate decision`);
+                return;
+              }
+              dispatched.add(triggerMessageId);
+              setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
+
+              clearTimeout(pending.timeoutId);
+              pendingDispatches.delete(triggerMessageId);
+
               ctx.log?.info(`${tag} [coord] Dispatch decision: RESPOND for ${triggerMessageId.slice(0, 8)}`);
               const prefixedText = synthesizeContext
                 ? `${synthesizeContext}\n\n${pending.text}`
@@ -549,8 +548,33 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.error(`${tag} [coord] Failed to write response summary: ${err}`);
                 });
               }
+            } else if (cancelPending) {
+              // Confirmed defer — other bot claimed or won tiebreaker. Clean up
+              // without dispatching and prevent backup timer from firing.
+              clearTimeout(pending.timeoutId);
+              pendingDispatches.delete(triggerMessageId);
+              dispatched.add(triggerMessageId);
+              setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
+              ctx.log?.info(`${tag} [coord] Confirmed defer for ${triggerMessageId.slice(0, 8)} — cleaned up`);
             } else {
-              ctx.log?.info(`${tag} [coord] Dispatch decision: SKIP for ${triggerMessageId.slice(0, 8)} (deferred/abstained)`);
+              // Initial defer — don't mark as dispatched yet. Set a backup timer
+              // as safety net for Realtime misses (if the other bot's READY never
+              // arrives, this ensures the message still gets a response).
+              ctx.log?.info(`${tag} [coord] Dispatch decision: DEFER for ${triggerMessageId.slice(0, 8)} — setting 8s backup timer`);
+              clearTimeout(pending.timeoutId);
+              const deferFallbackId = setTimeout(() => {
+                const stillPending = pendingDispatches.get(triggerMessageId);
+                if (!stillPending) return; // Already handled by another path
+                pendingDispatches.delete(triggerMessageId);
+                if (dispatched.has(triggerMessageId)) return; // Another path dispatched
+                dispatched.add(triggerMessageId);
+                setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
+                ctx.log?.warn(`${tag} [coord] Defer backup timer fired for ${triggerMessageId.slice(0, 8)} — dispatching (Realtime safety net)`);
+                doDispatch(stillPending.chatId, stillPending.text, stillPending.userId).catch((err) => {
+                  ctx.log?.error(`${tag} [coord] Defer backup dispatch failed: ${err.message}`);
+                });
+              }, 8_000);
+              pending.timeoutId = deferFallbackId;
             }
           },
           log: {
