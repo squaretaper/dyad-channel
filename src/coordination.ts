@@ -45,6 +45,10 @@ export interface CoordinationHandlerOpts {
   callGateway: (prompt: string, timeoutMs: number) => Promise<string | null>;
   postToCoordination: (content: string) => Promise<void>;
   onDispatchDecision?: (decision: DispatchDecision) => Promise<void>;
+  /** Load previous round outcomes for prompt injection. Returns formatted string or empty. */
+  loadHistory?: (excludeRoundId: string) => Promise<string>;
+  /** Load recent bot responses from the main chat for cross-agent awareness. */
+  loadRecentResponses?: (sourceChatId: string) => Promise<string>;
   log: {
     info(m: string): void;
     warn(m: string): void;
@@ -78,6 +82,8 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     sourceChatId: string | null;
     roundId: string;
     timeoutId: ReturnType<typeof setTimeout>;
+    coordHistory: string;       // previous round context (loaded once per round)
+    recentResponses: string;    // what other bots recently said in the main chat
   }
 
   const rounds = new Map<string, RoundState>();
@@ -182,10 +188,13 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
 
   // --- Gateway prompt helpers ---
 
-  async function generateProposal(roundStart: any): Promise<Proposal | null> {
+  async function generateProposal(roundStart: any, coordHistory: string, recentResponses: string): Promise<Proposal | null> {
+    const historySection = coordHistory ? `\n${coordHistory}\n` : "";
+    const responsesSection = recentResponses ? `\n${recentResponses}\n` : "";
+
     const prompt = `[COORDINATION — assess and propose. Respond with JSON only, no other text]
 Message from user: "${(roundStart.trigger_content || "").slice(0, 500)}"
-
+${historySection}${responsesSection}
 First assess: does this message benefit from multiple agent perspectives, or would a single focused response be better?
 
 Respond with a structured proposal:
@@ -272,9 +281,12 @@ Either accept as-is or revise your covers to avoid overlap:
       ? "\nBoth agents assessed that a single response would suffice."
       : "";
 
+    const historySection = round.coordHistory ? `\n${round.coordHistory}\n` : "";
+    const responsesSection = round.recentResponses ? `\n${round.recentResponses}\n` : "";
+
     const prompt = `[COORDINATION — choose your final intent. Respond with JSON only, no other text]
 User message: "${round.triggerContent.slice(0, 300)}"
-Your angle: "${round.myProposal.angle}", covers: [${round.myProposal.covers.join(", ")}]${otherContext}
+${historySection}${responsesSection}Your angle: "${round.myProposal.angle}", covers: [${round.myProposal.covers.join(", ")}]${otherContext}
 ${soloNote}
 
 - CLAIM: you respond from your angle
@@ -336,8 +348,10 @@ Choose ONE:
     const shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
 
     if (opts.onDispatchDecision) {
+      const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
+      const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
       const synthesizeCtx = shouldRespond
-        ? `[Coordination round completed. Your angle: "${round.myProposal.angle}"${
+        ? `[Coordination round completed.${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}"${
             round.otherName
               ? `, ${round.otherName}'s angle: "${round.otherProposal?.angle || "unspecified"}"`
               : ""
@@ -388,9 +402,35 @@ Choose ONE:
       sourceChatId: parsed.source_chat_id || null,
       roundId,
       timeoutId,
+      coordHistory: "",
+      recentResponses: "",
     });
 
-    const proposal = await generateProposal(parsed);
+    // Load coordination history + recent bot responses in parallel.
+    // Promise.allSettled: partial failures don't block the round.
+    const historyResults = await Promise.allSettled([
+      opts.loadHistory?.(roundId) ?? Promise.resolve(""),
+      parsed.source_chat_id
+        ? (opts.loadRecentResponses?.(parsed.source_chat_id) ?? Promise.resolve(""))
+        : Promise.resolve(""),
+    ]);
+
+    const coordHistory = historyResults[0].status === "fulfilled" ? historyResults[0].value : "";
+    const recentResponses = historyResults[1].status === "fulfilled" ? historyResults[1].value : "";
+    if (historyResults[0].status === "rejected") log.warn(`History load failed: ${historyResults[0].reason}`);
+    if (historyResults[1].status === "rejected") log.warn(`Recent responses load failed: ${historyResults[1].reason}`);
+
+    // Store in round state for use in later prompts (generateFinalIntent, synthesizeContext)
+    const currentRound = rounds.get(roundId);
+    if (currentRound) {
+      currentRound.coordHistory = coordHistory;
+      currentRound.recentResponses = recentResponses;
+    }
+
+    if (coordHistory) log.info(`Loaded coordination history (${coordHistory.length} chars)`);
+    if (recentResponses) log.info(`Loaded recent responses (${recentResponses.length} chars)`);
+
+    const proposal = await generateProposal(parsed, coordHistory, recentResponses);
     if (!proposal) {
       log.error("Failed to generate proposal — skipping round");
       rounds.delete(roundId);

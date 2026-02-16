@@ -14,6 +14,11 @@ import {
 import { createCoordinationHandler, type CoordinationHandler } from "./coordination.js";
 import { COORDINATION_PROTOCOL_VERSION } from "./types-coordination.js";
 import { getDyadRuntime } from "./runtime.js";
+import {
+  loadCoordinationHistory,
+  loadRecentBotResponses,
+  writeResponseSummary,
+} from "./coordination-history.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -296,8 +301,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
       // Set after bus is created (needs bus.sendMessage). The wrapper ensures
       // callers always go through the current implementation even if captured early.
-      let doDispatchImpl: ((chatId: string, text: string, userId: string) => Promise<void>) | null = null;
-      const doDispatch = (chatId: string, text: string, userId: string): Promise<void> => {
+      // Returns the response text (concatenated from all deliver callbacks) for summary capture.
+      let doDispatchImpl: ((chatId: string, text: string, userId: string) => Promise<string>) | null = null;
+      const doDispatch = (chatId: string, text: string, userId: string): Promise<string> => {
         if (!doDispatchImpl) {
           return Promise.reject(new Error("doDispatch called before initialization"));
         }
@@ -433,7 +439,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       });
 
       // --- Native dispatch helper (uses bus.sendMessage for delivery) ---
-      doDispatchImpl = async (chatId: string, text: string, userId: string) => {
+      // Returns the response text (concatenated from all deliver callbacks).
+      doDispatchImpl = async (chatId: string, text: string, userId: string): Promise<string> => {
+        const responseParts: string[] = [];
         try {
           const rt = getDyadRuntime();
           ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
@@ -460,6 +468,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               deliver: async (payload, { kind }) => {
                 ctx.log?.info(`${tag} Delivering ${kind} reply (text=${!!payload.text}, error=${!!payload.isError})`);
                 if (payload.text) {
+                  responseParts.push(payload.text);
                   await bus.sendMessage(chatId, payload.text);
                   ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
                 }
@@ -483,6 +492,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         } catch (err: any) {
           ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
         }
+        return responseParts.join("\n");
       };
 
       // Create coordination handler after bus is ready
@@ -491,7 +501,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           botName: account.botName,
           callGateway: (prompt, timeoutMs) => callGateway(prompt, timeoutMs),
           postToCoordination,
-          onDispatchDecision: async ({ triggerMessageId, shouldRespond, synthesizeContext }) => {
+          loadHistory: (excludeRoundId) =>
+            loadCoordinationHistory(bus.client, account.coordChatId!, excludeRoundId),
+          loadRecentResponses: (sourceChatId) =>
+            loadRecentBotResponses(bus.client, sourceChatId, account.botName),
+          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext }) => {
             if (!triggerMessageId) {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
               return;
@@ -521,7 +535,20 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               const prefixedText = synthesizeContext
                 ? `${synthesizeContext}\n\n${pending.text}`
                 : pending.text;
-              await doDispatch(pending.chatId, prefixedText, pending.userId);
+              const responseText = await doDispatch(pending.chatId, prefixedText, pending.userId);
+
+              // Write response summary to dedicated table (not #coordination)
+              if (responseText && responseText.length > 0) {
+                writeResponseSummary(bus.client, {
+                  coordChatId: account.coordChatId!,
+                  roundId,
+                  speaker: account.botName,
+                  content: responseText,
+                  sourceChatId: pending.chatId,
+                }).catch((err) => {
+                  ctx.log?.error(`${tag} [coord] Failed to write response summary: ${err}`);
+                });
+              }
             } else {
               ctx.log?.info(`${tag} [coord] Dispatch decision: SKIP for ${triggerMessageId.slice(0, 8)} (deferred/abstained)`);
             }
