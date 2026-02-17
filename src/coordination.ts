@@ -327,7 +327,27 @@ Choose ONE:
     round.phase = "locked";
     clearTimeout(round.timeoutId);
 
-    const intent: FinalIntent = await generateFinalIntent(round);
+    // Solo-sufficient tiebreaker: when both proposals agree a single response
+    // suffices, skip the LLM final intent call entirely. Deterministic pick:
+    // lexicographically lower botName claims, the other defers. This prevents
+    // both bots independently choosing "claim" and double-dispatching.
+    const bothSoloSufficient =
+      round.myProposal.solo_sufficient &&
+      round.otherProposal?.solo_sufficient &&
+      round.otherName;
+
+    let intent: FinalIntent;
+    if (bothSoloSufficient) {
+      const iWin = botName < (round.otherName || "");
+      intent = iWin
+        ? { type: "claim", scope: `solo tiebreaker — ${botName} responds` }
+        : { type: "defer", to: round.otherName!, reason: "solo tiebreaker — other bot responds" };
+      log.info(
+        `Both solo_sufficient — tiebreaker: ${iWin ? `${botName} CLAIMS` : `${round.otherName} CLAIMS, we DEFER`}`,
+      );
+    } else {
+      intent = await generateFinalIntent(round);
+    }
     round.myFinalIntent = intent;
 
     const summary = round.otherName
@@ -339,18 +359,17 @@ Choose ONE:
         protocol: COORDINATION_PROTOCOL_VERSION,
         round_id: round.roundId,
         kind: "ready",
-        intent: intent || { type: "claim", scope: round.myProposal.angle },
+        intent,
         my_proposal: round.myProposal,
         other_proposal: round.otherProposal || undefined,
         summary,
         source_chat_id: round.sourceChatId || null,
       }),
     );
-    log.info(`READY (LOCKED): intent=${intent?.type || "claim"}, summary="${summary}"`);
+    log.info(`READY (LOCKED): intent=${intent.type}, summary="${summary}"`);
 
     // Signal dispatch decision — plugin uses this to dispatch or suppress
-    const finalIntent: FinalIntent = intent || { type: "claim", scope: round.myProposal.angle };
-    let shouldRespond = finalIntent.type === "claim" || finalIntent.type === "synthesize";
+    let shouldRespond = intent.type === "claim" || intent.type === "synthesize";
     let cancelPending = false;
 
     // Both-defer detection: if we're deferring and already know the other bot's intent
