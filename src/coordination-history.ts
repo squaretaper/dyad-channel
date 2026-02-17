@@ -141,7 +141,7 @@ export async function loadCoordinationHistory(
       try {
         const parsed = JSON.parse(msg.content);
         if (parsed.round_id === excludeRoundId) continue;
-        if (parsed.protocol !== COORDINATION_PROTOCOL_VERSION) continue;
+        if (parsed.protocol !== "dyad-coord-v1" && parsed.protocol !== "dyad-coord-v2") continue;
 
         // Skip response_summary kind in messages (legacy — now in separate table)
         if (parsed.kind === "response_summary") continue;
@@ -152,6 +152,22 @@ export async function loadCoordinationHistory(
             created_at: msg.created_at,
             round_id: parsed.round_id,
             intent: parsed.intent,
+          });
+        } else if (parsed.kind === "micro_propose" && parsed.proposal) {
+          entries.push({
+            speaker: msg.speaker,
+            created_at: msg.created_at,
+            round_id: parsed.round_id,
+            kind: "micro_propose",
+            summaryContent: `angle: "${parsed.proposal.angle}", confidence: ${parsed.proposal.confidence}`,
+          });
+        } else if (parsed.kind === "resolved") {
+          entries.push({
+            speaker: msg.speaker,
+            created_at: msg.created_at,
+            round_id: parsed.round_id,
+            kind: "resolved",
+            summaryContent: `${parsed.mode}: winner=${parsed.winner || "n/a"}, ${parsed.reason || ""}`,
           });
         }
       } catch {
@@ -203,6 +219,10 @@ export async function loadCoordinationHistory(
       for (const entry of roundEntries) {
         if (entry.intent) {
           lines.push(`- ${entry.speaker}: ${formatIntent(entry.intent)}`);
+        } else if (entry.kind === "micro_propose" && entry.summaryContent) {
+          lines.push(`- ${entry.speaker} proposed: ${entry.summaryContent}`);
+        } else if (entry.kind === "resolved" && entry.summaryContent) {
+          lines.push(`- ${entry.speaker} resolved: ${entry.summaryContent}`);
         } else if (entry.kind === "response_summary" && entry.summaryContent) {
           const truncated =
             entry.summaryContent.length > 1000

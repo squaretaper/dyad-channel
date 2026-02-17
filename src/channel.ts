@@ -12,7 +12,7 @@ import {
   type ResolvedDyadAccount,
 } from "./types.js";
 import { createCoordinationHandler, type CoordinationHandler } from "./coordination.js";
-import { COORDINATION_PROTOCOL_VERSION } from "./types-coordination.js";
+import { COORDINATION_PROTOCOL_VERSION, type MicroProposal, type RegisterState } from "./types-coordination.js";
 import { getDyadRuntime } from "./runtime.js";
 import {
   loadCoordinationHistory,
@@ -216,11 +216,21 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       const gatewayQueue: Array<() => void> = [];
       let gatewayStopped = false;
 
+      interface GatewayCallOpts {
+        model?: string;     // default: "openclaw:main"
+        sessionId?: string; // default: "dyad:coord"
+        retries?: number;   // default: 1
+      }
+
       async function callGateway(
         prompt: string,
         timeoutMs: number,
-        retries: number = 1,
+        gwOpts?: GatewayCallOpts,
       ): Promise<string | null> {
+        const retries = gwOpts?.retries ?? 1;
+        const model = gwOpts?.model ?? "openclaw:main";
+        const sessionId = gwOpts?.sessionId ?? "dyad:coord";
+
         for (let attempt = 0; attempt <= retries; attempt++) {
           // Concurrency guard — wait if at capacity
           if (activeGatewayCalls >= MAX_CONCURRENT_GATEWAY_CALLS) {
@@ -230,11 +240,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           activeGatewayCalls++;
           try {
             const thisTimeout = attempt === 0 ? timeoutMs : timeoutMs * 2;
-            // Single stable session per bot — matches the old sidecar approach.
-            // All coordination calls share one session so the bot accumulates
-            // context across rounds. Depth cap (MAX_COORDINATION_DEPTH) bounds
-            // the conversation, not session isolation.
-            const sessionId = `dyad:coord`;
             const res = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
@@ -242,7 +247,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 Authorization: `Bearer ${account.gatewayToken}`,
               },
               body: JSON.stringify({
-                model: "openclaw:main",
+                model,
                 user: sessionId,
                 messages: [{ role: "user", content: prompt }],
               }),
@@ -276,6 +281,38 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           }
         }
         return null;
+      }
+
+      // --- Haiku micro-proposal caller (gateway model pass-through) ---
+      const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+
+      function callHaiku(prompt: string): Promise<string | null> {
+        return callGateway(prompt, 5000, {
+          model: HAIKU_MODEL,
+          sessionId: `micro:${Date.now()}`,  // stateless — no session accumulation
+          retries: 0,                         // fast fail for micro-proposals
+        });
+      }
+
+      // --- In-memory state register (turn-taking context per chat) ---
+      const stateRegister = new Map<string, RegisterState>();
+
+      function getRegister(chatId: string): RegisterState | undefined {
+        return stateRegister.get(chatId);
+      }
+
+      function updateRegister(chatId: string, responderName: string, proposal: MicroProposal): void {
+        const current = stateRegister.get(chatId) || {
+          topic: "", lastResponder: "", recentAngles: [], updatedAt: "",
+        };
+        current.lastResponder = responderName;
+        current.recentAngles = [
+          { agent: responderName, angle: proposal.angle, roundId: "" },
+          ...current.recentAngles.filter(a => a.agent !== responderName).slice(0, 4),
+        ];
+        current.topic = proposal.covers[0] || current.topic;
+        current.updatedAt = new Date().toISOString();
+        stateRegister.set(chatId, current);
       }
 
       // --- Create coordination handler (if configured) ---
@@ -382,6 +419,23 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
 
+          // Hard routing: @mention → skip coordination, dispatch directly
+          if (coordEnabled) {
+            const mentionMatch = text.match(/@(\w+)/i);
+            if (mentionMatch) {
+              const mentioned = mentionMatch[1].toLowerCase();
+              const myName = account.botName.toLowerCase();
+              if (mentioned === myName) {
+                ctx.log?.info(`${tag} @mention hard route — dispatching directly to ${account.botName}`);
+                await doDispatch(chatId, text, userId);
+                return;
+              } else {
+                ctx.log?.info(`${tag} @mention hard route — ${mentionMatch[1]} handles this, skipping`);
+                return;
+              }
+            }
+          }
+
           // Coordination-aware dispatch: if coordination is active, hold dispatch
           // and let the coordination handler decide based on negotiation outcome.
           if (coordEnabled && coordination) {
@@ -408,7 +462,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.error(`${tag} Fallback dispatch failed for ${messageId.slice(0, 8)}: ${err.message}`);
                 });
               }
-            }, 30_000);
+            }, 10_000);
 
             pendingDispatches.set(messageId, { chatId, text, userId, timeoutId });
             ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, starting round`);
@@ -538,12 +592,14 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         coordination = createCoordinationHandler({
           botName: account.botName,
           callGateway: (prompt, timeoutMs) => callGateway(prompt, timeoutMs),
+          callHaiku,
           postToCoordination,
+          getRegister,
           loadHistory: (excludeRoundId) =>
             loadCoordinationHistory(bus.client, account.coordChatId!, excludeRoundId),
           loadRecentResponses: (sourceChatId) =>
             loadRecentBotResponses(bus.client, sourceChatId, account.botName),
-          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext, cancelPending }) => {
+          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext, cancelPending, proposal, sourceChatId }) => {
             if (!triggerMessageId) {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
               return;
@@ -585,6 +641,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 }).catch((err) => {
                   ctx.log?.error(`${tag} [coord] Failed to write response summary: ${err}`);
                 });
+              }
+
+              // Update state register for turn-taking
+              if (proposal && sourceChatId) {
+                updateRegister(sourceChatId, account.botName, proposal);
               }
             } else if (cancelPending) {
               // Confirmed defer — other bot claimed or won tiebreaker. Clean up

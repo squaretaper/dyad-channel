@@ -1,25 +1,24 @@
 /**
  * Coordination protocol handler for the Dyad channel plugin.
  *
- * Ported from lib/coordination/sidecar.ts — same negotiation logic,
- * but injectable (no Supabase, no process globals). Receives messages
- * from the bus, delegates gateway calls via injected functions.
+ * v2: Haiku micro-proposals + deterministic SOLO filter
+ *   - Each bot generates a micro-proposal via Haiku (~200ms)
+ *   - Pure-logic filter picks ONE winner (no LLM needed)
+ *   - Both bots agree deterministically (same inputs → same output)
+ *   - State register biases turn-taking via prompt context (not filter logic)
  *
- * Layer 1: Structured negotiation (PROPOSE -> ACCEPT/COUNTER -> READY)
- *   - Proposals are structured: { angle, covers[], defers[] }
- *   - Mechanical diff: if covers don't overlap, ACCEPT immediately (no LLM call)
- *   - COUNTER only fires on actual overlap in covers fields
- *   - READY includes both proposals so agents know the full division of labor
- *
- * Layer 2: General inter-agent comms (bidirectional pass-through)
- *   - AgentMessage, resolution signals, free-form dialogue all handled
- *   - Suppressed during active coordination rounds to avoid gateway saturation
+ * Layer 2: General inter-agent comms (unchanged from v1)
+ *   - AgentMessage, resolution signals, free-form dialogue
+ *   - Suppressed during active coordination rounds
  */
 
 import {
   COORDINATION_PROTOCOL_VERSION,
+  CONFIDENCE_EPSILON,
   MAX_COORDINATION_DEPTH,
-  type Proposal,
+  type MicroProposal,
+  type RegisterState,
+  type FilterResult,
   type ParsedCoordinationMessage,
 } from "./types-coordination.js";
 
@@ -40,17 +39,25 @@ export interface DispatchDecision {
   synthesizeContext?: string;
   /** When true, confirms a defer and cancels any backup timer (no dispatch needed). */
   cancelPending?: boolean;
+  /** Micro-proposal of the responding bot (for register update). */
+  proposal?: MicroProposal;
+  /** Source chat ID (for register update). */
+  sourceChatId?: string;
 }
 
 export interface CoordinationHandlerOpts {
   botName: string;
   callGateway: (prompt: string, timeoutMs: number) => Promise<string | null>;
+  /** Haiku call for micro-proposals — routed through gateway model pass-through */
+  callHaiku: (prompt: string) => Promise<string | null>;
   postToCoordination: (content: string) => Promise<void>;
   onDispatchDecision?: (decision: DispatchDecision) => Promise<void>;
   /** Load previous round outcomes for prompt injection. Returns formatted string or empty. */
   loadHistory?: (excludeRoundId: string) => Promise<string>;
   /** Load recent bot responses from the main chat for cross-agent awareness. */
   loadRecentResponses?: (sourceChatId: string) => Promise<string>;
+  /** Read state register for a chat (turn-taking context). */
+  getRegister?: (chatId: string) => RegisterState | undefined;
   log: {
     info(m: string): void;
     warn(m: string): void;
@@ -62,35 +69,111 @@ export interface CoordinationHandlerOpts {
 // Constants
 // ============================================================================
 
-const ROUND_TIMEOUT_MS = 12000;
-const ROUND_CLEANUP_MS = 30000;
-const SEEN_TTL_MS = 720_000; // 12 min — must exceed staleness watchdog (10 min) to survive reconnection replays
+const ROUND_TIMEOUT_MS = 5000;   // v2: fast Haiku resolution
+const ROUND_CLEANUP_MS = 15000;  // v2: rounds resolve faster
+const SEEN_TTL_MS = 720_000;     // 12 min — must exceed staleness watchdog (10 min)
+
+// ============================================================================
+// Pure logic: coordination filter
+// ============================================================================
+
+/**
+ * Deterministic coordination filter — always returns SOLO with a winner.
+ *
+ * Both bots run this independently with the same inputs and MUST agree.
+ * The filter uses only proposal data (confidence scores + names), never
+ * register state (which could differ between bots → disagreement).
+ *
+ * Rules:
+ * 1. Higher confidence wins
+ * 2. If difference < CONFIDENCE_EPSILON → lexicographic tiebreaker on botName
+ */
+function coordinationFilter(
+  myProposal: MicroProposal,
+  otherProposal: MicroProposal,
+  myName: string,
+  otherName: string,
+): FilterResult {
+  const diff = myProposal.confidence - otherProposal.confidence;
+  const proposals: Record<string, MicroProposal> = {
+    [myName]: myProposal,
+    [otherName]: otherProposal,
+  };
+
+  if (Math.abs(diff) < CONFIDENCE_EPSILON) {
+    // Tie — lexicographic tiebreaker (deterministic from both perspectives)
+    const winner = myName < otherName ? myName : otherName;
+    return {
+      mode: "solo",
+      winner,
+      reason: `confidence tie (${myProposal.confidence.toFixed(2)} vs ${otherProposal.confidence.toFixed(2)}) — lexicographic: ${winner}`,
+      proposals,
+    };
+  }
+
+  if (diff > 0) {
+    return {
+      mode: "solo",
+      winner: myName,
+      reason: `confidence gap: ${myName} ${myProposal.confidence.toFixed(2)} > ${otherName} ${otherProposal.confidence.toFixed(2)}`,
+      proposals,
+    };
+  }
+
+  return {
+    mode: "solo",
+    winner: otherName,
+    reason: `confidence gap: ${otherName} ${otherProposal.confidence.toFixed(2)} > ${myName} ${myProposal.confidence.toFixed(2)}`,
+    proposals,
+  };
+}
+
+/**
+ * Keyword Jaccard similarity between two micro-proposals.
+ * Used for context injection (describing angle overlap), NOT for routing.
+ */
+function angleSimilarity(a: MicroProposal, b: MicroProposal): number {
+  const extractKeywords = (p: MicroProposal): Set<string> => {
+    const words = `${p.angle} ${p.covers.join(" ")}`
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+    return new Set(words);
+  };
+
+  const aWords = extractKeywords(a);
+  const bWords = extractKeywords(b);
+  if (aWords.size === 0 && bWords.size === 0) return 1;
+  if (aWords.size === 0 || bWords.size === 0) return 0;
+
+  const intersection = [...aWords].filter((w) => bWords.has(w)).length;
+  const union = new Set([...aWords, ...bWords]).size;
+  return union > 0 ? intersection / union : 0;
+}
 
 // ============================================================================
 // Factory
 // ============================================================================
 
 export function createCoordinationHandler(opts: CoordinationHandlerOpts): CoordinationHandler {
-  const { botName, callGateway, postToCoordination, log } = opts;
+  const { botName, postToCoordination, log } = opts;
 
-  // --- Per-round negotiation state ---
-  interface RoundState {
-    phase: "proposed" | "locked";
-    myProposal: Proposal;
-    otherProposal?: Proposal;
-    otherName?: string;
+  // --- Per-round state ---
+  interface MicroRound {
+    roundId: string;
     triggerContent: string;
     triggerMessageId: string | null;
     sourceChatId: string | null;
-    roundId: string;
+    myProposal: MicroProposal | null;
+    otherProposal: MicroProposal | null;
+    otherName: string | null;
+    coordHistory: string;
+    recentResponses: string;
     timeoutId: ReturnType<typeof setTimeout>;
-    coordHistory: string;       // previous round context (loaded once per round)
-    recentResponses: string;    // what other bots recently said in the main chat
-    myFinalIntent?: FinalIntent;      // stored after lockRound generates intent
-    otherFinalIntent?: FinalIntent;   // stored when other bot's READY is received
+    resolved: boolean;
   }
 
-  const rounds = new Map<string, RoundState>();
+  const rounds = new Map<string, MicroRound>();
 
   // --- Deduplication ---
   const seenMessageIds = new Set<string>();
@@ -106,18 +189,15 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     return false;
   }
 
-  // --- Active round check (suppresses Layer 2 during negotiation) ---
+  // --- Active round check (suppresses Layer 2 during coordination) ---
   function hasActiveRound(): boolean {
     for (const round of rounds.values()) {
-      if (round.phase !== "locked") return true;
+      if (!round.resolved) return true;
     }
     return false;
   }
 
   // --- Write-side dedup: tracks stimuli we've already responded to ---
-  // Keyed on stimulus content (speaker + content hash), not response content
-  // (which varies per LLM call). Prevents replayed messages from triggering
-  // duplicate responses after reconnection.
   const RESPONDED_TTL_MS = 600_000; // 10 min
   const respondedTo = new Set<string>();
 
@@ -129,11 +209,10 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     return false;
   }
 
-  // --- Layer 2 concurrency guard (prevents gateway saturation) ---
+  // --- Layer 2 concurrency guard ---
   const MAX_LAYER2_INFLIGHT = 2;
   let layer2Inflight = 0;
 
-  /** Guarded gateway call for Layer 2 — returns null if at capacity or on error. */
   async function callGatewayGuarded(prompt: string, timeoutMs: number): Promise<string | null> {
     if (layer2Inflight >= MAX_LAYER2_INFLIGHT) {
       log.warn(`Layer 2 call dropped — ${layer2Inflight} already in flight`);
@@ -141,7 +220,7 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     }
     layer2Inflight++;
     try {
-      return await callGateway(prompt, timeoutMs);
+      return await opts.callGateway(prompt, timeoutMs);
     } finally {
       layer2Inflight--;
     }
@@ -165,291 +244,216 @@ export function createCoordinationHandler(opts: CoordinationHandlerOpts): Coordi
     return true;
   }
 
-  // --- Mechanical proposal diffing ---
-  function coversOverlap(myCovers: string[], theirCovers: string[]): string[] {
-    const normalize = (s: string) =>
-      new Set(
-        s
-          .toLowerCase()
-          .split(/\s+/)
-          .filter((w) => w.length > 1),
-      );
-    const overlapping: string[] = [];
+  // --- Micro-proposal generation ---
 
-    for (const mine of myCovers) {
-      const myWords = normalize(mine);
-      for (const theirs of theirCovers) {
-        const theirWords = normalize(theirs);
-        const common = [...myWords].filter((w) => theirWords.has(w));
-        if (common.length > 0 && common.length / Math.min(myWords.size, theirWords.size) >= 0.5) {
-          overlapping.push(`"${mine}" <-> "${theirs}"`);
-        }
-      }
+  async function generateMicroProposal(
+    triggerContent: string,
+    coordHistory: string,
+    recentResponses: string,
+    register: RegisterState | undefined,
+  ): Promise<MicroProposal | null> {
+    let registerContext = "";
+    if (register && register.lastResponder) {
+      const anglesFormatted = register.recentAngles
+        .map((a) => `${a.agent}: "${a.angle}"`)
+        .join(", ");
+      registerContext = `\n[Context: Last responder was ${register.lastResponder}. Recent angles: ${anglesFormatted}. Topic: ${register.topic}.]`;
     }
 
-    return overlapping;
-  }
+    const historySection = coordHistory ? `\n${coordHistory}` : "";
+    const responsesSection = recentResponses ? `\n${recentResponses}` : "";
 
-  // --- Gateway prompt helpers ---
+    const prompt = `You are coordinating with another AI agent on how to respond to a user message.
+Assess this message and express what you would say about it.
 
-  async function generateProposal(roundStart: any, coordHistory: string, recentResponses: string): Promise<Proposal | null> {
-    const historySection = coordHistory ? `\n${coordHistory}\n` : "";
-    const responsesSection = recentResponses ? `\n${recentResponses}\n` : "";
+User message: "${triggerContent.slice(0, 500)}"${registerContext}${historySection}${responsesSection}
 
-    const prompt = `[COORDINATION — assess and propose. Respond with JSON only, no other text]
-Message from user: "${(roundStart.trigger_content || "").slice(0, 500)}"
-${historySection}${responsesSection}
-First assess: does this message benefit from multiple agent perspectives, or would a single focused response be better?
+Respond with ONLY a JSON object:
+{"angle": "<your unique angle/perspective>", "confidence": <0.0-1.0>, "covers": ["<topic1>", "<topic2>"], "solo_sufficient": <true/false>}
 
-Respond with a structured proposal:
-{"angle": "<your angle>", "covers": ["<topic 1>", ...], "defers": ["<topics for other agent>"], "solo_sufficient": <true if one good response would fully address this>}
+confidence: How strongly do you feel YOUR perspective adds unique value? 0.0 = nothing to add, 1.0 = essential perspective.
+solo_sufficient: Could a single focused response fully address this, or do multiple perspectives genuinely help?`;
 
-If solo_sufficient is true, still propose your angle — but be prepared to defer if the other agent's angle is stronger.`;
-
-    const content = await callGateway(prompt, 15000);
+    // Try Haiku first (fast, cheap), fall back to gateway if unavailable
+    let content = await opts.callHaiku(prompt);
+    if (!content) {
+      log.warn("Haiku call returned null — falling back to gateway for micro-proposal");
+      content = await opts.callGateway(prompt, 8000);
+    }
     if (!content) return null;
 
     try {
       const match = content.match(/\{[\s\S]*?\}/);
-      if (!match) return { angle: content.slice(0, 100), covers: [], defers: [] };
+      if (!match) {
+        return {
+          angle: content.slice(0, 100),
+          confidence: 0.5,
+          covers: [],
+          solo_sufficient: true,
+        };
+      }
       const parsed = JSON.parse(match[0]);
       return {
         angle: parsed.angle || content.slice(0, 100),
+        confidence: typeof parsed.confidence === "number"
+          ? Math.max(0, Math.min(1, parsed.confidence))
+          : 0.5,
         covers: Array.isArray(parsed.covers) ? parsed.covers : [],
-        defers: Array.isArray(parsed.defers) ? parsed.defers : [],
-        solo_sufficient: parsed.solo_sufficient === true,
+        solo_sufficient: parsed.solo_sufficient !== false,
       };
     } catch {
-      return { angle: content.slice(0, 100), covers: [], defers: [] };
+      return {
+        angle: content.slice(0, 100),
+        confidence: 0.5,
+        covers: [],
+        solo_sufficient: true,
+      };
     }
   }
 
-  async function generateCounterOrAccept(
-    round: RoundState,
-    otherName: string,
-    otherProposal: Proposal,
-    overlap: string[],
-  ): Promise<{ accept: boolean; revisedProposal?: Proposal }> {
-    const prompt = `[COORDINATION — resolve overlap. Respond with JSON only, no other text]
-Message: "${round.triggerContent.slice(0, 300)}"
-Your proposal: angle="${round.myProposal.angle}", covers=[${round.myProposal.covers.join(", ")}]
-${otherName}'s proposal: angle="${otherProposal.angle}", covers=[${otherProposal.covers.join(", ")}]
-Overlapping areas: ${overlap.join(", ")}
+  // --- Round resolution ---
 
-Either accept as-is or revise your covers to avoid overlap:
-- {"decision": "accept"} — overlap is minor, proceed as-is
-- {"decision": "counter", "angle": "<revised>", "covers": ["<non-overlapping topics>"], "defers": ["<what you leave>"]}`;
-
-    const content = await callGateway(prompt, 8000);
-    if (!content) return { accept: true };
-
-    try {
-      const match = content.match(/\{[\s\S]*?\}/);
-      if (!match) return { accept: true };
-      const parsed = JSON.parse(match[0]);
-      if (parsed.decision === "counter" && parsed.angle) {
-        return {
-          accept: false,
-          revisedProposal: {
-            angle: parsed.angle,
-            covers: Array.isArray(parsed.covers) ? parsed.covers : round.myProposal.covers,
-            defers: Array.isArray(parsed.defers) ? parsed.defers : round.myProposal.defers,
-          },
-        };
-      }
-      return { accept: true };
-    } catch {
-      return { accept: true };
-    }
-  }
-
-  interface FinalIntent {
-    type: "claim" | "synthesize" | "defer" | "abstain";
-    scope?: string;
-    with?: string;
-    to?: string;
-    reason?: string;
-    topic?: string;
-  }
-
-  async function generateFinalIntent(round: RoundState): Promise<FinalIntent> {
-    const otherContext =
-      round.otherName && round.otherProposal
-        ? `\n${round.otherName}'s angle: "${round.otherProposal.angle}", covers: [${round.otherProposal.covers.join(", ")}]`
-        : "";
-
-    const bothSoloSufficient =
-      round.myProposal.solo_sufficient &&
-      round.otherProposal?.solo_sufficient;
-    const soloNote = bothSoloSufficient
-      ? "\nBoth agents assessed that a single response would suffice."
-      : "";
-
-    const historySection = round.coordHistory ? `\n${round.coordHistory}\n` : "";
-    const responsesSection = round.recentResponses ? `\n${round.recentResponses}\n` : "";
-
-    const prompt = `[COORDINATION — choose your final intent. Respond with JSON only, no other text]
-User message: "${round.triggerContent.slice(0, 300)}"
-${historySection}${responsesSection}Your angle: "${round.myProposal.angle}", covers: [${round.myProposal.covers.join(", ")}]${otherContext}
-${soloNote}
-
-- CLAIM: you respond from your angle
-- DEFER: the other agent's angle covers this well enough alone
-- SYNTHESIZE: both angles needed, weave together
-- ABSTAIN: not well-suited to contribute
-
-Choose ONE:
-- {"type":"claim","scope":"..."}
-- {"type":"defer","to":"${round.otherName || "other"}","reason":"..."}
-- {"type":"synthesize","with":"${round.otherName || "other"}","topic":"..."}
-- {"type":"abstain","reason":"..."}`;
-
-    const content = await callGateway(prompt, 8000);
-    if (!content) return { type: "claim", scope: round.myProposal.angle };
-
-    try {
-      const match = content.match(/\{[\s\S]*?\}/);
-      if (!match) return { type: "claim", scope: round.myProposal.angle };
-      const parsed = JSON.parse(match[0]);
-      if (["claim", "defer", "synthesize", "abstain"].includes(parsed.type)) {
-        return parsed;
-      }
-      return { type: "claim", scope: round.myProposal.angle };
-    } catch {
-      return { type: "claim", scope: round.myProposal.angle };
-    }
-  }
-
-  // --- Negotiation handlers ---
-
-  async function lockRound(round: RoundState): Promise<void> {
-    if (round.phase === "locked") return;
-    round.phase = "locked";
+  async function resolveRound(round: MicroRound): Promise<void> {
+    if (round.resolved) return;
+    round.resolved = true;
     clearTimeout(round.timeoutId);
 
-    // Solo-sufficient tiebreaker: when both proposals agree a single response
-    // suffices, skip the LLM final intent call entirely. Deterministic pick:
-    // lexicographically lower botName claims, the other defers. This prevents
-    // both bots independently choosing "claim" and double-dispatching.
-    const bothSoloSufficient =
-      round.myProposal.solo_sufficient &&
-      round.otherProposal?.solo_sufficient &&
-      round.otherName;
-
-    let intent: FinalIntent;
-    if (bothSoloSufficient) {
-      const iWin = botName < (round.otherName || "");
-      intent = iWin
-        ? { type: "claim", scope: `solo tiebreaker — ${botName} responds` }
-        : { type: "defer", to: round.otherName!, reason: "solo tiebreaker — other bot responds" };
-      log.info(
-        `Both solo_sufficient — tiebreaker: ${iWin ? `${botName} CLAIMS` : `${round.otherName} CLAIMS, we DEFER`}`,
-      );
-    } else {
-      intent = await generateFinalIntent(round);
+    if (!round.myProposal || !round.otherProposal || !round.otherName) {
+      log.error(`resolveRound called with incomplete state — dispatching fail-open`);
+      if (opts.onDispatchDecision) {
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: true,
+            sourceChatId: round.sourceChatId || undefined,
+          });
+        } catch (e: any) {
+          log.error(`Fail-open dispatch failed: ${e.message}`);
+        }
+      }
+      return;
     }
-    round.myFinalIntent = intent;
 
-    const summary = round.otherName
-      ? `${botName}: ${round.myProposal.angle} (${round.myProposal.covers.join(", ")}), ${round.otherName}: ${round.otherProposal?.angle || "unspecified"} (${round.otherProposal?.covers.join(", ") || ""})`
-      : `${round.myProposal.angle} (${round.myProposal.covers.join(", ")})`;
+    const result = coordinationFilter(
+      round.myProposal,
+      round.otherProposal,
+      botName,
+      round.otherName,
+    );
 
+    const iWin = result.winner === botName;
+    const similarity = angleSimilarity(round.myProposal, round.otherProposal);
+
+    log.info(
+      `RESOLVED: mode=${result.mode}, winner=${result.winner}, reason="${result.reason}", angleSimilarity=${similarity.toFixed(2)}`,
+    );
+
+    // Post resolved message to #coordination (for logging/history)
     await postToCoordination(
       JSON.stringify({
         protocol: COORDINATION_PROTOCOL_VERSION,
         round_id: round.roundId,
-        kind: "ready",
-        intent,
+        kind: "resolved",
+        mode: result.mode,
+        winner: result.winner,
+        reason: result.reason,
         my_proposal: round.myProposal,
-        other_proposal: round.otherProposal || undefined,
-        summary,
+        other_proposal: round.otherProposal,
         source_chat_id: round.sourceChatId || null,
       }),
     );
-    log.info(`READY (LOCKED): intent=${intent.type}, summary="${summary}"`);
 
-    // Signal dispatch decision — plugin uses this to dispatch or suppress
-    let shouldRespond = intent.type === "claim" || intent.type === "synthesize";
-    let cancelPending = false;
+    if (!opts.onDispatchDecision) return;
 
-    // Both-defer detection: if we're deferring and already know the other bot's intent
-    // (their READY arrived before we locked — e.g. we locked via handleReady), check
-    // for both-defer scenario and use alphabetical tiebreaker.
-    if (!shouldRespond && round.otherFinalIntent) {
-      const otherDeferred = round.otherFinalIntent.type === "defer" || round.otherFinalIntent.type === "abstain";
-      if (otherDeferred) {
-        if (botName < (round.otherName || "")) {
-          log.warn(`Both deferred (lockRound) — ${botName} wins tiebreaker, overriding to CLAIM`);
-          shouldRespond = true;
-        } else {
-          log.info(`Both deferred (lockRound) — ${round.otherName} wins tiebreaker, confirming defer`);
-          cancelPending = true;
-        }
-      }
-    }
-
-    if (opts.onDispatchDecision) {
+    if (iWin) {
       const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
       const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
-      const synthesizeCtx = shouldRespond
-        ? `[Coordination round completed.${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}"${
-            round.otherName
-              ? `, ${round.otherName}'s angle: "${round.otherProposal?.angle || "unspecified"}"`
-              : ""
-          }. Division: ${summary}]`
-        : undefined;
+      const otherAngle = round.otherProposal
+        ? `, ${round.otherName}'s angle: "${round.otherProposal.angle}"`
+        : "";
+
+      const synthesizeCtx = `[Coordination resolved.${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}"${otherAngle}. You were selected to respond (${result.reason}).]`;
 
       try {
         await opts.onDispatchDecision({
           roundId: round.roundId,
           triggerMessageId: round.triggerMessageId,
-          shouldRespond,
+          shouldRespond: true,
           synthesizeContext: synthesizeCtx,
-          cancelPending,
+          proposal: round.myProposal,
+          sourceChatId: round.sourceChatId || undefined,
         });
       } catch (e: any) {
-        log.error(`onDispatchDecision failed: ${e.message}`);
+        log.error(`Winner dispatch failed: ${e.message}`);
+      }
+    } else {
+      try {
+        await opts.onDispatchDecision({
+          roundId: round.roundId,
+          triggerMessageId: round.triggerMessageId,
+          shouldRespond: false,
+          cancelPending: true,
+        });
+      } catch (e: any) {
+        log.error(`Loser cancel failed: ${e.message}`);
       }
     }
   }
 
+  // --- Round handlers ---
+
   async function handleTimeout(roundId: string): Promise<void> {
     const round = rounds.get(roundId);
-    if (!round || round.phase === "locked") return;
+    if (!round || round.resolved) return;
 
-    log.warn(`Round ${roundId} timeout — auto-READY`);
-    await lockRound(round);
+    log.warn(`Round ${roundId} timeout — fail-open dispatch`);
+    round.resolved = true;
+
+    if (opts.onDispatchDecision) {
+      try {
+        await opts.onDispatchDecision({
+          roundId,
+          triggerMessageId: round.triggerMessageId,
+          shouldRespond: true,
+          sourceChatId: round.sourceChatId || undefined,
+        });
+      } catch (e: any) {
+        log.error(`Timeout dispatch failed: ${e.message}`);
+      }
+    }
   }
 
   async function handleRoundStart(parsed: any): Promise<void> {
     const roundId = parsed.round_id;
 
-    // Dedup: skip if we're already handling this round (covers Realtime re-delivery
-    // with different notification IDs but same round_id)
     if (rounds.has(roundId)) {
       log.info(`Round ${roundId} already in progress — skipping duplicate round_start`);
       return;
     }
 
-    log.info(`Round ${roundId} started — generating PROPOSE`);
+    log.info(`Round ${roundId} started — generating micro-proposal`);
 
-    // Create round state BEFORE gateway call so incoming PROPOSEs aren't dropped
-    const placeholder: Proposal = { angle: "", covers: [], defers: [] };
     const timeoutId = setTimeout(() => handleTimeout(roundId), ROUND_TIMEOUT_MS);
-    rounds.set(roundId, {
-      phase: "proposed",
-      myProposal: placeholder,
+    const round: MicroRound = {
+      roundId,
       triggerContent: parsed.trigger_content || "",
       triggerMessageId: parsed.trigger_message_id || null,
       sourceChatId: parsed.source_chat_id || null,
-      roundId,
-      timeoutId,
+      myProposal: null,
+      otherProposal: null,
+      otherName: null,
       coordHistory: "",
       recentResponses: "",
-    });
+      timeoutId,
+      resolved: false,
+    };
+    rounds.set(roundId, round);
 
-    // Load coordination history + recent bot responses in parallel.
-    // Promise.allSettled: partial failures don't block the round.
+    // Cleanup timer — garbage collect round state
+    setTimeout(() => rounds.delete(roundId), ROUND_CLEANUP_MS);
+
+    // Load coordination history + recent bot responses in parallel
     const historyResults = await Promise.allSettled([
       opts.loadHistory?.(roundId) ?? Promise.resolve(""),
       parsed.source_chat_id
@@ -462,30 +466,39 @@ Choose ONE:
     if (historyResults[0].status === "rejected") log.warn(`History load failed: ${historyResults[0].reason}`);
     if (historyResults[1].status === "rejected") log.warn(`Recent responses load failed: ${historyResults[1].reason}`);
 
-    // Store in round state for use in later prompts (generateFinalIntent, synthesizeContext)
     const currentRound = rounds.get(roundId);
-    if (currentRound) {
-      currentRound.coordHistory = coordHistory;
-      currentRound.recentResponses = recentResponses;
-    }
+    if (!currentRound || currentRound.resolved) return;
+    currentRound.coordHistory = coordHistory;
+    currentRound.recentResponses = recentResponses;
 
     if (coordHistory) log.info(`Loaded coordination history (${coordHistory.length} chars)`);
     if (recentResponses) log.info(`Loaded recent responses (${recentResponses.length} chars)`);
 
-    const proposal = await generateProposal(parsed, coordHistory, recentResponses);
+    // Read state register for turn-taking context
+    const register = parsed.source_chat_id
+      ? opts.getRegister?.(parsed.source_chat_id)
+      : undefined;
+
+    // Generate micro-proposal
+    const proposal = await generateMicroProposal(
+      currentRound.triggerContent,
+      coordHistory,
+      recentResponses,
+      register,
+    );
+
     if (!proposal) {
-      log.error("Failed to generate proposal — dispatching immediately (fail-open)");
+      log.error("Failed to generate micro-proposal — dispatching immediately (fail-open)");
       rounds.delete(roundId);
       clearTimeout(timeoutId);
 
-      // Fail-open: dispatch immediately when proposal generation fails.
-      // Without this, pendingDispatches would sit for 30s until the timeout fires.
       if (opts.onDispatchDecision) {
         try {
           await opts.onDispatchDecision({
             roundId,
             triggerMessageId: parsed.trigger_message_id || null,
             shouldRespond: true,
+            sourceChatId: parsed.source_chat_id || undefined,
           });
         } catch (e: any) {
           log.error(`Fail-open dispatch failed: ${e.message}`);
@@ -494,241 +507,58 @@ Choose ONE:
       return;
     }
 
-    // Cleanup timer starts AFTER proposal generation so slow proposals
-    // don't race with the 30s window
-    setTimeout(() => rounds.delete(roundId), ROUND_CLEANUP_MS);
+    // Check round is still active (may have been resolved by timeout during proposal gen)
+    const activeRound = rounds.get(roundId);
+    if (!activeRound || activeRound.resolved) return;
+    activeRound.myProposal = proposal;
 
-    // Update round state with actual proposal
-    const round = rounds.get(roundId);
-    if (round) {
-      round.myProposal = proposal;
-    }
-
-    // Post structured PROPOSE
+    // Post micro_propose to #coordination
     await postToCoordination(
       JSON.stringify({
         protocol: COORDINATION_PROTOCOL_VERSION,
         round_id: roundId,
-        kind: "propose",
+        kind: "micro_propose",
         proposal,
-        source_chat_id: round?.sourceChatId || null,
+        source_chat_id: activeRound.sourceChatId || null,
       }),
     );
     log.info(
-      `PROPOSE: angle="${proposal.angle}" covers=[${proposal.covers.join(", ")}] defers=[${proposal.defers.join(", ")}]`,
+      `MICRO_PROPOSE: angle="${proposal.angle}" confidence=${proposal.confidence.toFixed(2)} covers=[${proposal.covers.join(", ")}]`,
     );
 
-    // If the other agent's PROPOSE arrived while we were generating ours, process it now
-    if (round && round.otherProposal && round.phase === "proposed") {
-      log.info(
-        `Processing queued PROPOSE from ${round.otherName} (arrived during our gateway call)`,
-      );
-      await handlePropose(round.otherName!, {
-        round_id: roundId,
-        proposal: round.otherProposal,
-      });
+    // If the other bot's micro_propose arrived while we were generating ours, resolve now
+    if (activeRound.otherProposal && activeRound.otherName && !activeRound.resolved) {
+      log.info(`Processing queued micro_propose from ${activeRound.otherName}`);
+      await resolveRound(activeRound);
     }
   }
 
-  async function handlePropose(speaker: string, parsed: any): Promise<void> {
+  async function handleMicroPropose(speaker: string, parsed: any): Promise<void> {
     const roundId = parsed.round_id;
     const round = rounds.get(roundId);
 
-    if (!round || round.phase === "locked") return;
+    if (!round || round.resolved) return;
 
-    const otherProposal: Proposal = parsed.proposal || {
-      angle: parsed.scope || "",
+    const otherProposal: MicroProposal = parsed.proposal || {
+      angle: "",
+      confidence: 0.5,
       covers: [],
-      defers: [],
+      solo_sufficient: true,
     };
     round.otherProposal = otherProposal;
     round.otherName = speaker;
     log.info(
-      `${speaker} PROPOSE: angle="${otherProposal.angle}" covers=[${otherProposal.covers.join(", ")}]`,
+      `${speaker} MICRO_PROPOSE: angle="${otherProposal.angle}" confidence=${otherProposal.confidence.toFixed(2)}`,
     );
 
-    // If our own proposal isn't ready yet (placeholder), just store theirs
-    if (!round.myProposal.angle) {
-      log.info(`Queued ${speaker}'s PROPOSE — waiting for our own proposal to finish generating`);
+    // If our own proposal isn't ready yet, just store theirs
+    if (!round.myProposal) {
+      log.info(`Queued ${speaker}'s micro_propose — waiting for our own proposal`);
       return;
     }
 
-    // Fast-path: if both proposals have solo_sufficient, skip overlap resolution
-    // entirely. Simple messages ("?", "test", "hi") don't benefit from multi-agent
-    // overlap negotiation — saves 1-2 gateway calls (~5-10s latency).
-    if (round.myProposal.solo_sufficient && otherProposal.solo_sufficient) {
-      log.info("Both solo_sufficient — skipping overlap, immediate ACCEPT");
-      await postToCoordination(
-        JSON.stringify({
-          protocol: COORDINATION_PROTOCOL_VERSION,
-          round_id: roundId,
-          kind: "accept",
-          source_chat_id: round.sourceChatId || null,
-        }),
-      );
-      await lockRound(round);
-      return;
-    }
-
-    // Mechanical diff: check covers overlap
-    const overlap = coversOverlap(round.myProposal.covers, otherProposal.covers);
-
-    if (overlap.length === 0) {
-      // No overlap — ACCEPT immediately, no LLM call needed
-      await postToCoordination(
-        JSON.stringify({
-          protocol: COORDINATION_PROTOCOL_VERSION,
-          round_id: roundId,
-          kind: "accept",
-          source_chat_id: round.sourceChatId || null,
-        }),
-      );
-      log.info("ACCEPT — no covers overlap (mechanical diff)");
-      await lockRound(round);
-    } else {
-      // Overlap detected — call gateway to resolve
-      log.info(`Overlap detected: ${overlap.join(", ")} — calling gateway for resolution`);
-      const decision = await generateCounterOrAccept(round, speaker, otherProposal, overlap);
-
-      if (decision.accept) {
-        await postToCoordination(
-          JSON.stringify({
-            protocol: COORDINATION_PROTOCOL_VERSION,
-            round_id: roundId,
-            kind: "accept",
-            source_chat_id: round.sourceChatId || null,
-          }),
-        );
-        log.info("ACCEPT — gateway resolved overlap");
-        await lockRound(round);
-      } else if (decision.revisedProposal) {
-        round.myProposal = decision.revisedProposal;
-        await postToCoordination(
-          JSON.stringify({
-            protocol: COORDINATION_PROTOCOL_VERSION,
-            round_id: roundId,
-            kind: "counter",
-            proposal: decision.revisedProposal,
-            source_chat_id: round.sourceChatId || null,
-          }),
-        );
-        log.info(
-          `COUNTER: angle="${decision.revisedProposal.angle}" covers=[${decision.revisedProposal.covers.join(", ")}]`,
-        );
-      }
-    }
-  }
-
-  async function handleAccept(speaker: string, parsed: any): Promise<void> {
-    const roundId = parsed.round_id;
-    const round = rounds.get(roundId);
-
-    if (!round || round.phase === "locked") return;
-
-    log.info(`${speaker} ACCEPT`);
-    await lockRound(round);
-  }
-
-  async function handleCounter(speaker: string, parsed: any): Promise<void> {
-    const roundId = parsed.round_id;
-    const round = rounds.get(roundId);
-
-    if (!round || round.phase === "locked") return;
-
-    const otherProposal: Proposal = parsed.proposal || {
-      angle: parsed.scope || "",
-      covers: [],
-      defers: [],
-    };
-    round.otherProposal = otherProposal;
-    round.otherName = speaker;
-    log.info(
-      `${speaker} COUNTER: angle="${otherProposal.angle}" covers=[${otherProposal.covers.join(", ")}]`,
-    );
-
-    // Accept the counter (max one counter round to stay within time budget)
-    await postToCoordination(
-      JSON.stringify({
-        protocol: COORDINATION_PROTOCOL_VERSION,
-        round_id: roundId,
-        kind: "accept",
-        source_chat_id: round.sourceChatId || null,
-      }),
-    );
-    log.info("ACCEPT counter — locking");
-    await lockRound(round);
-  }
-
-  async function handleReady(speaker: string, parsed: any): Promise<void> {
-    const roundId = parsed.round_id;
-    const round = rounds.get(roundId);
-
-    if (!round) return;
-
-    log.info(`${speaker} READY: ${parsed.summary || ""}`);
-
-    // Store other bot's final intent for both-defer detection
-    if (parsed.intent) {
-      round.otherFinalIntent = parsed.intent;
-    }
-
-    if (round.phase !== "locked") {
-      await lockRound(round);
-    } else {
-      // Already locked — check for both-defer or we-deferred-they-claimed scenarios.
-      // This branch fires for the bot that locked first (via timeout or ACCEPT)
-      // and then receives the other bot's READY afterward.
-      const myDeferred = round.myFinalIntent &&
-        (round.myFinalIntent.type === "defer" || round.myFinalIntent.type === "abstain");
-
-      if (myDeferred && parsed.intent && opts.onDispatchDecision) {
-        const otherDeferred = parsed.intent.type === "defer" || parsed.intent.type === "abstain";
-
-        if (otherDeferred) {
-          // Both deferred — tiebreaker: alphabetically first bot claims
-          if (botName < speaker) {
-            log.warn(`Both deferred (handleReady) — ${botName} wins tiebreaker, dispatching`);
-            const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
-            const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
-            try {
-              await opts.onDispatchDecision({
-                roundId: round.roundId,
-                triggerMessageId: round.triggerMessageId,
-                shouldRespond: true,
-                synthesizeContext: `[Both agents initially deferred. Responding as fallback.${historySection}${responsesSection}\nMessage: "${round.triggerContent.slice(0, 300)}"]`,
-              });
-            } catch (e: any) {
-              log.error(`Both-defer tiebreaker dispatch failed: ${e.message}`);
-            }
-          } else {
-            log.info(`Both deferred (handleReady) — ${speaker} wins tiebreaker, confirming our defer`);
-            try {
-              await opts.onDispatchDecision({
-                roundId: round.roundId,
-                triggerMessageId: round.triggerMessageId,
-                shouldRespond: false,
-                cancelPending: true,
-              });
-            } catch (e: any) {
-              log.error(`Defer confirmation failed: ${e.message}`);
-            }
-          }
-        } else {
-          // We deferred, they claimed — confirm our defer (they'll handle it)
-          log.info(`${speaker} claimed — confirming our defer`);
-          try {
-            await opts.onDispatchDecision({
-              roundId: round.roundId,
-              triggerMessageId: round.triggerMessageId,
-              shouldRespond: false,
-              cancelPending: true,
-            });
-          } catch (e: any) {
-            log.error(`Defer confirmation failed: ${e.message}`);
-          }
-        }
-      }
-    }
+    // Both proposals ready — resolve
+    await resolveRound(round);
   }
 
   // --- Main message handler ---
@@ -742,35 +572,30 @@ Choose ONE:
 
     const { speaker, parsed } = msg;
 
-    // --- Layer 1: Structured negotiation ---
+    // --- Layer 1: v2 micro-proposal protocol ---
 
-    // OPEN: round_start from system -> generate PROPOSE
+    // round_start from system → generate micro-proposal
     if (parsed?.intent?.type === "round_start") {
       await handleRoundStart(parsed);
       return;
     }
 
-    // PROPOSE from other agent
-    if (parsed?.kind === "propose" && parsed?.round_id) {
-      await handlePropose(speaker, parsed);
+    // micro_propose from other agent
+    if (parsed?.kind === "micro_propose" && parsed?.round_id) {
+      await handleMicroPropose(speaker, parsed);
       return;
     }
 
-    // ACCEPT from other agent
-    if (parsed?.kind === "accept" && parsed?.round_id) {
-      await handleAccept(speaker, parsed);
+    // resolved — log only (each bot resolves locally)
+    if (parsed?.kind === "resolved" && parsed?.round_id) {
+      log.info(`${speaker} resolved round ${parsed.round_id}: ${parsed.reason || ""}`);
       return;
     }
 
-    // COUNTER from other agent
-    if (parsed?.kind === "counter" && parsed?.round_id) {
-      await handleCounter(speaker, parsed);
-      return;
-    }
-
-    // READY from other agent
-    if (parsed?.kind === "ready" && parsed?.round_id) {
-      await handleReady(speaker, parsed);
+    // --- v1 compatibility: silently skip obsolete message kinds ---
+    if (parsed?.kind === "propose" || parsed?.kind === "accept" ||
+        parsed?.kind === "counter" || parsed?.kind === "ready") {
+      log.info(`Skipping v1 message kind: ${parsed.kind}`);
       return;
     }
 
@@ -781,7 +606,6 @@ Choose ONE:
       parsed?.kind &&
       ["question", "inform", "delegate", "status", "flag"].includes(parsed.kind)
     ) {
-      // Only process messages directed at us or broadcast (no "to" field)
       if (parsed.to && parsed.to !== botName) {
         return;
       }
@@ -795,7 +619,6 @@ Choose ONE:
         parsed.kind === "question" ? "asks" : parsed.kind === "flag" ? "flags" : "says";
       const depth = parsed.depth || 0;
 
-      // Write-side dedup: skip if we've already responded to this stimulus
       if (alreadyRespondedTo(speaker, parsed.content || "")) {
         log.info(`AgentMessage from ${speaker} skipped — already responded to this stimulus`);
         return;
@@ -807,7 +630,6 @@ Choose ONE:
 
       const response = await callGatewayGuarded(`${prefix} ${kindLabel}]: ${parsed.content}`, 30000);
 
-      // Post reply back to #coordination if expects_reply and under depth cap
       if (
         isValidResponse(response) &&
         parsed.expects_reply !== false &&
@@ -834,7 +656,7 @@ Choose ONE:
       return;
     }
 
-    // Resolution signals (context injection — response discarded intentionally)
+    // Resolution signals
     if (parsed?.kind === "resolution") {
       log.info(`${speaker} ${parsed.signal}: ${parsed.summary || ""}`);
       if (!hasActiveRound()) {
@@ -885,8 +707,8 @@ Choose ONE:
       return;
     }
 
-    // Any other structured protocol message -> forward as context (skip during active rounds)
-    if (parsed && parsed.protocol === COORDINATION_PROTOCOL_VERSION) {
+    // Any other structured protocol message → forward as context
+    if (parsed && (parsed.protocol === COORDINATION_PROTOCOL_VERSION || parsed.protocol === "dyad-coord-v1")) {
       if (!hasActiveRound()) {
         await callGatewayGuarded(
           `[Coordination from ${speaker}]: ${JSON.stringify(parsed).slice(0, 300)}`,

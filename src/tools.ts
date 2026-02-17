@@ -257,6 +257,10 @@ export function createCoordHistoryTool(): ToolFactory {
                 summary = `[counter] angle: "${parsed.proposal?.angle || ""}"`;
               } else if (parsed.kind === "ready") {
                 summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 100)}"`;
+              } else if (parsed.kind === "micro_propose") {
+                summary = `[micro_propose] angle: "${parsed.proposal?.angle || ""}", confidence: ${parsed.proposal?.confidence ?? "n/a"}`;
+              } else if (parsed.kind === "resolved") {
+                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}, reason: "${(parsed.reason || "").slice(0, 100)}"`;
               } else if (parsed.kind === "response_summary") {
                 summary = `[response_summary] "${(parsed.content || "").slice(0, 150)}"`;
               } else if (
