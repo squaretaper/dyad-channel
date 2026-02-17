@@ -172,6 +172,47 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Message subscription (claude_request messages)
   // ============================================================================
 
+  // Shared handler for both INSERT and UPDATE events on claude_request messages.
+  // UPDATE events fire when a user_message is reinvoked (type changed to claude_request).
+  async function handleMessageEvent(payload: any): Promise<void> {
+    lastEventTime = Date.now();
+    try {
+      const msg = payload.new as DyadMessage;
+
+      // Skip our own messages (prevent loops)
+      if (msg.user_id === botUserId) {
+        return;
+      }
+
+      // Dedup layer 1: ID-based (exact row re-delivery)
+      if (seenMessageIds.has(msg.id)) {
+        onError(new Error(`Dedup(id): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+        return;
+      }
+      seenMessageIds.add(msg.id);
+      setTimeout(() => seenMessageIds.delete(msg.id), DEDUP_TTL_MS);
+
+      // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
+      const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
+      if (seenContentKeys.has(contentKey)) {
+        onError(new Error(`Dedup(content): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+        return;
+      }
+      seenContentKeys.add(contentKey);
+      setTimeout(() => seenContentKeys.delete(contentKey), DEDUP_CONTENT_TTL_MS);
+
+      await onMessage({
+        chatId: msg.chat_id,
+        text: msg.content ?? "",
+        userId: msg.user_id,
+        messageId: msg.id,
+        speaker: msg.speaker ?? "",
+      });
+    } catch (err) {
+      onError(err as Error, "handle message");
+    }
+  }
+
   function subscribeMessages(): void {
     if (messageChannel) {
       supabase.removeChannel(messageChannel);
@@ -188,44 +229,20 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
           table: "messages",
           filter: "message_type=eq.claude_request",
         },
-        async (payload: any) => {
-          lastEventTime = Date.now();
-          try {
-            const msg = payload.new as DyadMessage;
-
-            // Skip our own messages (prevent loops)
-            if (msg.user_id === botUserId) {
-              return;
-            }
-
-            // Dedup layer 1: ID-based (exact row re-delivery)
-            if (seenMessageIds.has(msg.id)) {
-              onError(new Error(`Dedup(id): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
-              return;
-            }
-            seenMessageIds.add(msg.id);
-            setTimeout(() => seenMessageIds.delete(msg.id), DEDUP_TTL_MS);
-
-            // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
-            const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
-            if (seenContentKeys.has(contentKey)) {
-              onError(new Error(`Dedup(content): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
-              return;
-            }
-            seenContentKeys.add(contentKey);
-            setTimeout(() => seenContentKeys.delete(contentKey), DEDUP_CONTENT_TTL_MS);
-
-            await onMessage({
-              chatId: msg.chat_id,
-              text: msg.content ?? "",
-              userId: msg.user_id,
-              messageId: msg.id,
-              speaker: msg.speaker ?? "",
-            });
-          } catch (err) {
-            onError(err as Error, "handle message");
-          }
+        handleMessageEvent,
+      )
+      // UPDATE subscription: catches reinvoke (user_message → claude_request).
+      // UPDATE Realtime events are less reliable than INSERT, but for a one-shot
+      // trigger like reinvoke this is acceptable — user can retry if missed.
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: "message_type=eq.claude_request",
         },
+        handleMessageEvent,
       )
       .subscribe((status: string) => {
         if (status === "SUBSCRIBED") {
