@@ -288,10 +288,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
       function callHaiku(prompt: string): Promise<string | null> {
-        return callGateway(prompt, 5000, {
+        return callGateway(prompt, 10000, {
           model: HAIKU_MODEL,
           sessionId: `micro:${Date.now()}`,  // stateless — no session accumulation
-          retries: 0,                         // fast fail for micro-proposals
+          retries: 1,                         // one retry for cold gateway starts
         });
       }
 
