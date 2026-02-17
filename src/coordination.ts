@@ -82,8 +82,8 @@ export interface CoordinationHandlerOpts {
 // Constants
 // ============================================================================
 
-const ROUND_TIMEOUT_MS = 5000;   // v2: fast Haiku resolution
-const ROUND_CLEANUP_MS = 15000;  // v2: rounds resolve faster
+const ROUND_TIMEOUT_MS = 15000;  // v3.5: must exceed Haiku timeout + Opus fallback
+const ROUND_CLEANUP_MS = 30000;  // v3.5: must exceed ROUND_TIMEOUT_MS
 const SEEN_TTL_MS = 720_000;     // 12 min — must exceed staleness watchdog (10 min)
 
 // ============================================================================

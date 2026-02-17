@@ -285,13 +285,13 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       }
 
       // --- Haiku micro-proposal caller (gateway model pass-through) ---
-      const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+      const HAIKU_MODEL = "anthropic/claude-haiku-4-5";
 
       function callHaiku(prompt: string): Promise<string | null> {
-        return callGateway(prompt, 10000, {
+        return callGateway(prompt, 8000, {
           model: HAIKU_MODEL,
           sessionId: `micro:${Date.now()}`,  // stateless — no session accumulation
-          retries: 1,                         // one retry for cold gateway starts
+          retries: 0,                         // fast fail → Opus fallback
         });
       }
 
