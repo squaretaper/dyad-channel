@@ -22,6 +22,32 @@ import {
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
+// Bus readiness — gates outbound.sendText until startAccount completes.
+// Prevents "Outbound not configured" errors after SIGUSR1 restart.
+const busReadyPromises = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+
+function getBusReadyPromise(accountId: string): Promise<void> {
+  const existing = busReadyPromises.get(accountId);
+  if (existing) return existing.promise;
+  let resolve: () => void;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  busReadyPromises.set(accountId, { promise, resolve: resolve! });
+  return promise;
+}
+
+function markBusReady(accountId: string): void {
+  const existing = busReadyPromises.get(accountId);
+  if (existing) {
+    existing.resolve();
+  } else {
+    // Already resolved or never created — create a pre-resolved entry
+    busReadyPromises.set(accountId, { promise: Promise.resolve(), resolve: () => {} });
+  }
+}
+
+function resetBusReady(accountId: string): void {
+  busReadyPromises.delete(accountId);
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -87,9 +113,21 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
     textChunkLimit: 10000, // Dyad/Supabase can handle larger messages
     sendText: async ({ to, text, accountId }) => {
       const aid = accountId ?? DEFAULT_ACCOUNT_ID;
-      const bus = activeBuses.get(aid);
+
+      // Wait for bus readiness (up to 5s) — handles SIGUSR1 restart race
+      // where outbound fires before startAccount completes.
+      let bus = activeBuses.get(aid);
       if (!bus) {
-        throw new Error(`Dyad bus not running for account ${aid}`);
+        const readyPromise = getBusReadyPromise(aid);
+        const timeout = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000));
+        const result = await Promise.race([readyPromise.then(() => "ready" as const), timeout]);
+        if (result === "timeout") {
+          throw new Error(`Dyad bus not ready for account ${aid} after 5s wait`);
+        }
+        bus = activeBuses.get(aid);
+        if (!bus) {
+          throw new Error(`Dyad bus not running for account ${aid}`);
+        }
       }
 
       // Guard: only deliver to valid chat UUIDs.
@@ -589,8 +627,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         );
       }
 
-      // Store the bus handle
+      // Store the bus handle and signal readiness
       activeBuses.set(account.accountId, bus);
+      markBusReady(account.accountId);
 
       ctx.log?.info(`${tag} Dyad provider started, listening for messages`);
 
@@ -618,6 +657,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             ctx.log?.error(`${tag} Error disconnecting: ${err.message}`);
           });
           activeBuses.delete(account.accountId);
+          resetBusReady(account.accountId);
           ctx.log?.info(`${tag} Dyad provider stopped`);
         },
       };

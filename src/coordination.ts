@@ -534,6 +534,23 @@ Choose ONE:
       return;
     }
 
+    // Fast-path: if both proposals have solo_sufficient, skip overlap resolution
+    // entirely. Simple messages ("?", "test", "hi") don't benefit from multi-agent
+    // overlap negotiation — saves 1-2 gateway calls (~5-10s latency).
+    if (round.myProposal.solo_sufficient && otherProposal.solo_sufficient) {
+      log.info("Both solo_sufficient — skipping overlap, immediate ACCEPT");
+      await postToCoordination(
+        JSON.stringify({
+          protocol: COORDINATION_PROTOCOL_VERSION,
+          round_id: roundId,
+          kind: "accept",
+          source_chat_id: round.sourceChatId || null,
+        }),
+      );
+      await lockRound(round);
+      return;
+    }
+
     // Mechanical diff: check covers overlap
     const overlap = coversOverlap(round.myProposal.covers, otherProposal.covers);
 

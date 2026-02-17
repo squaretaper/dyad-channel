@@ -372,6 +372,46 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     }, KEEPALIVE_INTERVAL_MS),
   );
 
+  // Polling fallback: catches Realtime misses (belt-and-suspenders).
+  // Every 5s, query recent claude_request messages and re-inject any
+  // that weren't delivered via Realtime. Dedup layers catch duplicates.
+  const POLL_INTERVAL_MS = 5_000;
+  const POLL_LOOKBACK_MS = 30_000;
+  intervals.push(
+    setInterval(async () => {
+      try {
+        const since = new Date(Date.now() - POLL_LOOKBACK_MS).toISOString();
+        const { data, error } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("message_type", "claude_request")
+          .gt("created_at", since)
+          .order("created_at", { ascending: true })
+          .limit(10);
+
+        if (error || !data) return;
+
+        for (const msg of data) {
+          // Skip own messages
+          if (msg.user_id === botUserId) continue;
+          // Dedup: if already seen by Realtime, the ID-based check will reject it.
+          // We still call onMessage — the upstream dedup layers (bus + channel)
+          // catch duplicates reliably.
+          if (seenMessageIds.has(msg.id)) continue;
+
+          // This is a missed message — inject it
+          onError(
+            new Error(`Polling caught missed msg ${msg.id.slice(0, 8)}`),
+            "polling fallback",
+          );
+          await handleMessageEvent({ new: msg });
+        }
+      } catch (e) {
+        onError(e as Error, "polling fallback");
+      }
+    }, POLL_INTERVAL_MS),
+  );
+
   // ============================================================================
   // Start subscriptions
   // ============================================================================
