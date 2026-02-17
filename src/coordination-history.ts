@@ -434,3 +434,48 @@ export async function writeResponseSummary(
     console.error(`[coord-history] writeResponseSummary error: ${e.message}`);
   }
 }
+
+// ============================================================================
+// waitForResponseSummary (v3.5 SYNTHESIS mode)
+// ============================================================================
+
+/**
+ * Poll the coordination_summaries table for a specific speaker's response in a round.
+ * Used by the SYNTHESIS runner-up to wait for the winner's response before dispatching.
+ *
+ * @returns The response content if found, null if timeout.
+ */
+export async function waitForResponseSummary(
+  client: SupabaseClient,
+  coordChatId: string,
+  roundId: string,
+  speakerName: string,
+  timeoutMs: number = 15000,
+): Promise<string | null> {
+  const POLL_INTERVAL_MS = 500;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const { data, error } = await client
+        .from("coordination_summaries")
+        .select("content")
+        .eq("coord_chat_id", coordChatId)
+        .eq("round_id", roundId)
+        .eq("speaker", speakerName)
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && data?.content) {
+        return data.content;
+      }
+    } catch {
+      // Resilience: table might not exist, network error, etc.
+    }
+
+    // Wait before next poll
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  return null;
+}

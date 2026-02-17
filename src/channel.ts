@@ -18,6 +18,7 @@ import {
   loadCoordinationHistory,
   loadRecentBotResponses,
   writeResponseSummary,
+  waitForResponseSummary,
 } from "./coordination-history.js";
 
 // Store active bus handles per account
@@ -599,7 +600,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             loadCoordinationHistory(bus.client, account.coordChatId!, excludeRoundId),
           loadRecentResponses: (sourceChatId) =>
             loadRecentBotResponses(bus.client, sourceChatId, account.botName),
-          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext, cancelPending, proposal, sourceChatId }) => {
+          onDispatchDecision: async ({ roundId, triggerMessageId, shouldRespond, synthesizeContext, cancelPending, proposal, sourceChatId, waitForResponse }) => {
             if (!triggerMessageId) {
               ctx.log?.warn(`${tag} [coord] Dispatch decision without triggerMessageId — ignoring`);
               return;
@@ -608,6 +609,85 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             const pending = pendingDispatches.get(triggerMessageId);
             if (!pending) {
               ctx.log?.warn(`${tag} [coord] No pending dispatch for ${triggerMessageId.slice(0, 8)} — may have timed out`);
+              return;
+            }
+
+            // --- SYNTHESIS runner-up: wait for winner's response, then dispatch ---
+            if (waitForResponse) {
+              clearTimeout(pending.timeoutId);
+              // Don't delete pending yet — we still need it for dispatch after waiting
+              ctx.log?.info(`${tag} [coord] SYNTHESIS runner-up — waiting for ${waitForResponse.winnerName}'s response (round ${roundId.slice(0, 8)})`);
+
+              // Poll for winner's response summary in background
+              const doSynthesisWait = async () => {
+                try {
+                  const winnerResponse = await waitForResponseSummary(
+                    bus.client,
+                    account.coordChatId!,
+                    waitForResponse.roundId,
+                    waitForResponse.winnerName,
+                    15000,
+                  );
+
+                  // Re-check pending — may have been cleaned up during wait
+                  const stillPending = pendingDispatches.get(triggerMessageId);
+                  if (!stillPending) {
+                    ctx.log?.warn(`${tag} [coord] SYNTHESIS pending gone after wait — skipping dispatch`);
+                    return;
+                  }
+                  if (dispatched.has(triggerMessageId)) {
+                    ctx.log?.warn(`${tag} [coord] SYNTHESIS already dispatched during wait — skipping`);
+                    return;
+                  }
+                  dispatched.add(triggerMessageId);
+                  setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
+                  pendingDispatches.delete(triggerMessageId);
+
+                  let synthesisCtx: string;
+                  if (winnerResponse) {
+                    ctx.log?.info(`${tag} [coord] SYNTHESIS got winner response (${winnerResponse.length} chars) — dispatching runner-up`);
+                    synthesisCtx = `[Coordination resolved: SYNTHESIS. ${waitForResponse.winnerName} responded first with: '${winnerResponse}'. Your angle: "${waitForResponse.myProposal.angle}". Respond to the user — you can extend, challenge, reframe, or add your unique perspective. Don't repeat what was already said.]`;
+                  } else {
+                    // Timeout — fall back to PARALLEL-style context (proposal-only)
+                    ctx.log?.warn(`${tag} [coord] SYNTHESIS timeout waiting for winner — falling back to parallel context`);
+                    synthesisCtx = `[Coordination resolved: PARALLEL (synthesis fallback). Your angle: "${waitForResponse.myProposal.angle}". ${waitForResponse.winnerName}'s angle: "${waitForResponse.otherProposal.angle}", covering ${waitForResponse.otherProposal.covers.join(", ")}. Both agents responding — focus on your unique angle.]`;
+                  }
+
+                  const prefixedText = `${synthesisCtx}\n\n${stillPending.text}`;
+                  const responseText = await doDispatch(stillPending.chatId, prefixedText, stillPending.userId);
+
+                  if (responseText && responseText.length > 0) {
+                    writeResponseSummary(bus.client, {
+                      coordChatId: account.coordChatId!,
+                      roundId,
+                      speaker: account.botName,
+                      content: responseText,
+                      sourceChatId: stillPending.chatId,
+                    }).catch((err) => {
+                      ctx.log?.error(`${tag} [coord] Failed to write SYNTHESIS response summary: ${err}`);
+                    });
+                  }
+
+                  if (proposal && sourceChatId) {
+                    updateRegister(sourceChatId, account.botName, proposal);
+                  }
+                } catch (e: any) {
+                  ctx.log?.error(`${tag} [coord] SYNTHESIS wait/dispatch failed: ${e.message}`);
+                  // Fail-open: try to dispatch anyway
+                  const fallbackPending = pendingDispatches.get(triggerMessageId);
+                  if (fallbackPending && !dispatched.has(triggerMessageId)) {
+                    dispatched.add(triggerMessageId);
+                    setTimeout(() => dispatched.delete(triggerMessageId), 60_000);
+                    pendingDispatches.delete(triggerMessageId);
+                    doDispatch(fallbackPending.chatId, fallbackPending.text, fallbackPending.userId).catch((err2) => {
+                      ctx.log?.error(`${tag} [coord] SYNTHESIS fail-open dispatch failed: ${err2.message}`);
+                    });
+                  }
+                }
+              };
+
+              // Run synthesis wait in background (non-blocking)
+              doSynthesisWait();
               return;
             }
 

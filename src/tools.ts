@@ -260,7 +260,8 @@ export function createCoordHistoryTool(): ToolFactory {
               } else if (parsed.kind === "micro_propose") {
                 summary = `[micro_propose] angle: "${parsed.proposal?.angle || ""}", confidence: ${parsed.proposal?.confidence ?? "n/a"}`;
               } else if (parsed.kind === "resolved") {
-                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}, reason: "${(parsed.reason || "").slice(0, 100)}"`;
+                const runnerUpLabel = parsed.runner_up ? `, runner_up: ${parsed.runner_up}` : "";
+                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}${runnerUpLabel}, reason: "${(parsed.reason || "").slice(0, 100)}"`;
               } else if (parsed.kind === "response_summary") {
                 summary = `[response_summary] "${(parsed.content || "").slice(0, 150)}"`;
               } else if (

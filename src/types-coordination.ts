@@ -19,6 +19,18 @@ export const RESPONSE_SUMMARY_MAX_CHARS = 500;
 /** Confidence difference below this is treated as a tie → lexicographic tiebreaker */
 export const CONFIDENCE_EPSILON = 0.01;
 
+// --- v3.5 filter thresholds ---
+/** Confidence gap above this → SOLO (clear winner) */
+export const CONFIDENCE_GAP_THRESHOLD = 0.3;
+/** Angle overlap below this → PARALLEL eligible (different angles) */
+export const ANGLE_OVERLAP_THRESHOLD = 0.5;
+/** Both agents need at least this confidence for PARALLEL/SYNTHESIS */
+export const HIGH_CONFIDENCE_THRESHOLD = 0.5;
+/** Below this → neither has strong conviction → SOLO fallback */
+export const LOW_CONFIDENCE_THRESHOLD = 0.3;
+/** Both agents need at least this confidence for SYNTHESIS */
+export const SYNTHESIS_CONFIDENCE_THRESHOLD = 0.7;
+
 // --- v1 Proposal (kept for Layer 2 / history parsing) ---
 
 export interface Proposal {
@@ -35,6 +47,7 @@ export interface MicroProposal {
   confidence: number;      // 0-1
   covers: string[];
   solo_sufficient: boolean;
+  builds_on_other?: boolean;  // v3.5: opt-in signal for synthesis mode
 }
 
 // --- v2 State Register ---
@@ -48,12 +61,12 @@ export interface RegisterState {
 
 // --- v2 Dispatch ---
 
-/** "sequential" will be added in v3.5 for synthesis */
-export type DispatchMode = "solo";
+export type DispatchMode = "solo" | "parallel" | "synthesis";
 
 export interface FilterResult {
   mode: DispatchMode;
-  winner: string;           // botName of the winner
+  winner: string;           // primary responder (all modes)
+  runnerUp?: string;        // v3.5: second responder (parallel/synthesis)
   reason: string;           // human-readable for logging
   proposals: Record<string, MicroProposal>;
 }

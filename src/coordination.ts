@@ -15,9 +15,15 @@
 import {
   COORDINATION_PROTOCOL_VERSION,
   CONFIDENCE_EPSILON,
+  CONFIDENCE_GAP_THRESHOLD,
+  ANGLE_OVERLAP_THRESHOLD,
+  HIGH_CONFIDENCE_THRESHOLD,
+  LOW_CONFIDENCE_THRESHOLD,
+  SYNTHESIS_CONFIDENCE_THRESHOLD,
   MAX_COORDINATION_DEPTH,
   type MicroProposal,
   type RegisterState,
+  type DispatchMode,
   type FilterResult,
   type ParsedCoordinationMessage,
 } from "./types-coordination.js";
@@ -43,6 +49,13 @@ export interface DispatchDecision {
   proposal?: MicroProposal;
   /** Source chat ID (for register update). */
   sourceChatId?: string;
+  /** v3.5 SYNTHESIS mode — runner-up waits for winner's response before dispatching. */
+  waitForResponse?: {
+    roundId: string;
+    winnerName: string;
+    myProposal: MicroProposal;
+    otherProposal: MicroProposal;
+  };
 }
 
 export interface CoordinationHandlerOpts {
@@ -78,15 +91,22 @@ const SEEN_TTL_MS = 720_000;     // 12 min — must exceed staleness watchdog (1
 // ============================================================================
 
 /**
- * Deterministic coordination filter — always returns SOLO with a winner.
+ * Deterministic coordination filter — routes to SOLO, PARALLEL, or SYNTHESIS.
  *
  * Both bots run this independently with the same inputs and MUST agree.
- * The filter uses only proposal data (confidence scores + names), never
- * register state (which could differ between bots → disagreement).
+ * The filter uses only proposal data (confidence, angle, covers, builds_on_other,
+ * names), never register state (which could differ between bots → disagreement).
  *
- * Rules:
- * 1. Higher confidence wins
- * 2. If difference < CONFIDENCE_EPSILON → lexicographic tiebreaker on botName
+ * Routing logic:
+ * 1. confidence_gap > 0.3 → SOLO (clear winner)
+ * 2. both > 0.5 AND angle_overlap < 0.5 → PARALLEL (complementary angles)
+ * 3. both > 0.7 AND angle_overlap >= 0.5 AND either builds_on_other → SYNTHESIS
+ * 4. both > 0.5 AND angle_overlap >= 0.5 → SOLO (overlapping, avoid duplication)
+ * 5. both < 0.3 → SOLO (neither has conviction)
+ * 6. else → SOLO (default)
+ *
+ * winner = higher confidence (or lexicographic tiebreaker).
+ * runnerUp = the other bot.
  */
 function coordinationFilter(
   myProposal: MicroProposal,
@@ -94,43 +114,96 @@ function coordinationFilter(
   myName: string,
   otherName: string,
 ): FilterResult {
-  const diff = myProposal.confidence - otherProposal.confidence;
   const proposals: Record<string, MicroProposal> = {
     [myName]: myProposal,
     [otherName]: otherProposal,
   };
 
+  // Determine winner (higher confidence, lexicographic tiebreaker)
+  const diff = myProposal.confidence - otherProposal.confidence;
+  let winner: string;
+  let runnerUp: string;
+
   if (Math.abs(diff) < CONFIDENCE_EPSILON) {
-    // Tie — lexicographic tiebreaker (deterministic from both perspectives)
-    const winner = myName < otherName ? myName : otherName;
+    // Tie — lexicographic tiebreaker
+    winner = myName < otherName ? myName : otherName;
+    runnerUp = winner === myName ? otherName : myName;
+  } else if (diff > 0) {
+    winner = myName;
+    runnerUp = otherName;
+  } else {
+    winner = otherName;
+    runnerUp = myName;
+  }
+
+  const confidenceGap = Math.abs(myProposal.confidence - otherProposal.confidence);
+  const overlap = angleSimilarity(myProposal, otherProposal);
+  const bothHigh = myProposal.confidence > HIGH_CONFIDENCE_THRESHOLD &&
+    otherProposal.confidence > HIGH_CONFIDENCE_THRESHOLD;
+  const bothLow = myProposal.confidence < LOW_CONFIDENCE_THRESHOLD &&
+    otherProposal.confidence < LOW_CONFIDENCE_THRESHOLD;
+  const bothSynthesisReady = myProposal.confidence > SYNTHESIS_CONFIDENCE_THRESHOLD &&
+    otherProposal.confidence > SYNTHESIS_CONFIDENCE_THRESHOLD;
+  const eitherBuildsOn = Boolean(myProposal.builds_on_other || otherProposal.builds_on_other);
+
+  const base = { winner, runnerUp, proposals };
+
+  // Rule 1: Large confidence gap → SOLO
+  if (confidenceGap > CONFIDENCE_GAP_THRESHOLD) {
     return {
-      mode: "solo",
-      winner,
-      reason: `confidence tie (${myProposal.confidence.toFixed(2)} vs ${otherProposal.confidence.toFixed(2)}) — lexicographic: ${winner}`,
-      proposals,
+      ...base,
+      mode: "solo" as DispatchMode,
+      reason: `confidence gap ${confidenceGap.toFixed(2)} > ${CONFIDENCE_GAP_THRESHOLD} — ${winner} wins`,
     };
   }
 
-  if (diff > 0) {
+  // Rule 2: Both high confidence + different angles → PARALLEL
+  if (bothHigh && overlap < ANGLE_OVERLAP_THRESHOLD) {
     return {
-      mode: "solo",
-      winner: myName,
-      reason: `confidence gap: ${myName} ${myProposal.confidence.toFixed(2)} > ${otherName} ${otherProposal.confidence.toFixed(2)}`,
-      proposals,
+      ...base,
+      mode: "parallel" as DispatchMode,
+      reason: `both confident (${myProposal.confidence.toFixed(2)}, ${otherProposal.confidence.toFixed(2)}), low overlap ${overlap.toFixed(2)} — parallel`,
     };
   }
 
+  // Rule 3: Both very high confidence + overlapping angles + opt-in → SYNTHESIS
+  if (bothSynthesisReady && overlap >= ANGLE_OVERLAP_THRESHOLD && eitherBuildsOn) {
+    return {
+      ...base,
+      mode: "synthesis" as DispatchMode,
+      reason: `both high confidence (${myProposal.confidence.toFixed(2)}, ${otherProposal.confidence.toFixed(2)}), overlap ${overlap.toFixed(2)}, builds_on_other — synthesis`,
+    };
+  }
+
+  // Rule 4: Both high confidence + overlapping angles → SOLO (avoid duplication)
+  if (bothHigh && overlap >= ANGLE_OVERLAP_THRESHOLD) {
+    return {
+      ...base,
+      mode: "solo" as DispatchMode,
+      reason: `both confident but overlapping (${overlap.toFixed(2)}) — solo: ${winner}`,
+    };
+  }
+
+  // Rule 5: Both low confidence → SOLO
+  if (bothLow) {
+    return {
+      ...base,
+      mode: "solo" as DispatchMode,
+      reason: `both low confidence (${myProposal.confidence.toFixed(2)}, ${otherProposal.confidence.toFixed(2)}) — solo: ${winner}`,
+    };
+  }
+
+  // Rule 6: Default → SOLO
   return {
-    mode: "solo",
-    winner: otherName,
-    reason: `confidence gap: ${otherName} ${otherProposal.confidence.toFixed(2)} > ${myName} ${myProposal.confidence.toFixed(2)}`,
-    proposals,
+    ...base,
+    mode: "solo" as DispatchMode,
+    reason: `default — solo: ${winner}`,
   };
 }
 
 /**
  * Keyword Jaccard similarity between two micro-proposals.
- * Used for context injection (describing angle overlap), NOT for routing.
+ * v3.5: Used by coordinationFilter for routing decisions (PARALLEL vs SOLO vs SYNTHESIS).
  */
 function angleSimilarity(a: MicroProposal, b: MicroProposal): number {
   const extractKeywords = (p: MicroProposal): Set<string> => {
@@ -269,10 +342,11 @@ Assess this message and express what you would say about it.
 User message: "${triggerContent.slice(0, 500)}"${registerContext}${historySection}${responsesSection}
 
 Respond with ONLY a JSON object:
-{"angle": "<your unique angle/perspective>", "confidence": <0.0-1.0>, "covers": ["<topic1>", "<topic2>"], "solo_sufficient": <true/false>}
+{"angle": "<your unique angle/perspective>", "confidence": <0.0-1.0>, "covers": ["<topic1>", "<topic2>"], "solo_sufficient": <true/false>, "builds_on_other": <true/false>}
 
 confidence: How strongly do you feel YOUR perspective adds unique value? 0.0 = nothing to add, 1.0 = essential perspective.
-solo_sufficient: Could a single focused response fully address this, or do multiple perspectives genuinely help?`;
+solo_sufficient: Could a single focused response fully address this, or do multiple perspectives genuinely help?
+builds_on_other: Would your response be meaningfully better if you could read the other agent's response first? true = you'd build on their arguments.`;
 
     // Try Haiku first (fast, cheap), fall back to gateway if unavailable
     let content = await opts.callHaiku(prompt);
@@ -300,6 +374,7 @@ solo_sufficient: Could a single focused response fully address this, or do multi
           : 0.5,
         covers: Array.isArray(parsed.covers) ? parsed.covers : [],
         solo_sufficient: parsed.solo_sufficient !== false,
+        builds_on_other: parsed.builds_on_other === true,
       };
     } catch {
       return {
@@ -346,7 +421,7 @@ solo_sufficient: Could a single focused response fully address this, or do multi
     const similarity = angleSimilarity(round.myProposal, round.otherProposal);
 
     log.info(
-      `RESOLVED: mode=${result.mode}, winner=${result.winner}, reason="${result.reason}", angleSimilarity=${similarity.toFixed(2)}`,
+      `RESOLVED: mode=${result.mode}, winner=${result.winner}${result.runnerUp ? `, runnerUp=${result.runnerUp}` : ""}, reason="${result.reason}", angleSimilarity=${similarity.toFixed(2)}`,
     );
 
     // Post resolved message to #coordination (for logging/history)
@@ -357,6 +432,7 @@ solo_sufficient: Could a single focused response fully address this, or do multi
         kind: "resolved",
         mode: result.mode,
         winner: result.winner,
+        runner_up: result.runnerUp || null,
         reason: result.reason,
         my_proposal: round.myProposal,
         other_proposal: round.otherProposal,
@@ -366,38 +442,124 @@ solo_sufficient: Could a single focused response fully address this, or do multi
 
     if (!opts.onDispatchDecision) return;
 
-    if (iWin) {
-      const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
-      const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
-      const otherAngle = round.otherProposal
-        ? `, ${round.otherName}'s angle: "${round.otherProposal.angle}"`
-        : "";
+    const historySection = round.coordHistory ? `\n${round.coordHistory}` : "";
+    const responsesSection = round.recentResponses ? `\n${round.recentResponses}` : "";
 
-      const synthesizeCtx = `[Coordination resolved.${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}"${otherAngle}. You were selected to respond (${result.reason}).]`;
+    // --- SOLO dispatch ---
+    if (result.mode === "solo") {
+      if (iWin) {
+        const otherAngle = round.otherProposal
+          ? `, ${round.otherName}'s angle: "${round.otherProposal.angle}"`
+          : "";
 
-      try {
-        await opts.onDispatchDecision({
-          roundId: round.roundId,
-          triggerMessageId: round.triggerMessageId,
-          shouldRespond: true,
-          synthesizeContext: synthesizeCtx,
-          proposal: round.myProposal,
-          sourceChatId: round.sourceChatId || undefined,
-        });
-      } catch (e: any) {
-        log.error(`Winner dispatch failed: ${e.message}`);
+        const synthesizeCtx = `[Coordination resolved.${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}"${otherAngle}. You were selected to respond (${result.reason}).]`;
+
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: true,
+            synthesizeContext: synthesizeCtx,
+            proposal: round.myProposal,
+            sourceChatId: round.sourceChatId || undefined,
+          });
+        } catch (e: any) {
+          log.error(`Winner dispatch failed: ${e.message}`);
+        }
+      } else {
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: false,
+            cancelPending: true,
+          });
+        } catch (e: any) {
+          log.error(`Loser cancel failed: ${e.message}`);
+        }
       }
-    } else {
-      try {
-        await opts.onDispatchDecision({
-          roundId: round.roundId,
-          triggerMessageId: round.triggerMessageId,
-          shouldRespond: false,
-          cancelPending: true,
-        });
-      } catch (e: any) {
-        log.error(`Loser cancel failed: ${e.message}`);
+      return;
+    }
+
+    // --- PARALLEL dispatch ---
+    if (result.mode === "parallel") {
+      const myAngle = round.myProposal.angle;
+      const otherAngle = round.otherProposal!.angle;
+      const otherCovers = round.otherProposal!.covers.join(", ");
+
+      if (iWin) {
+        const synthesizeCtx = `[Coordination resolved: PARALLEL.${historySection}${responsesSection}\nYour angle: "${myAngle}". ${round.otherName}'s angle: "${otherAngle}", covering ${otherCovers}. You were selected as primary. Respond to the user — your perspectives complement each other.]`;
+
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: true,
+            synthesizeContext: synthesizeCtx,
+            proposal: round.myProposal,
+            sourceChatId: round.sourceChatId || undefined,
+          });
+        } catch (e: any) {
+          log.error(`PARALLEL winner dispatch failed: ${e.message}`);
+        }
+      } else {
+        const synthesizeCtx = `[Coordination resolved: PARALLEL.${historySection}${responsesSection}\nYour angle: "${myAngle}". ${round.otherName}'s angle: "${otherAngle}", covering ${otherCovers}. Both agents responding — focus on your unique angle.]`;
+
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: true,
+            synthesizeContext: synthesizeCtx,
+            proposal: round.myProposal,
+            sourceChatId: round.sourceChatId || undefined,
+          });
+        } catch (e: any) {
+          log.error(`PARALLEL runner-up dispatch failed: ${e.message}`);
+        }
       }
+      return;
+    }
+
+    // --- SYNTHESIS dispatch ---
+    if (result.mode === "synthesis") {
+      if (iWin) {
+        // Winner dispatches first, normally
+        const synthesizeCtx = `[Coordination resolved: SYNTHESIS (you go first).${historySection}${responsesSection}\nYour angle: "${round.myProposal.angle}". ${round.otherName} will build on your response.]`;
+
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: true,
+            synthesizeContext: synthesizeCtx,
+            proposal: round.myProposal,
+            sourceChatId: round.sourceChatId || undefined,
+          });
+        } catch (e: any) {
+          log.error(`SYNTHESIS winner dispatch failed: ${e.message}`);
+        }
+      } else {
+        // Runner-up: don't respond yet, enter waiting state
+        try {
+          await opts.onDispatchDecision({
+            roundId: round.roundId,
+            triggerMessageId: round.triggerMessageId,
+            shouldRespond: false,
+            proposal: round.myProposal,
+            sourceChatId: round.sourceChatId || undefined,
+            waitForResponse: {
+              roundId: round.roundId,
+              winnerName: result.winner,
+              myProposal: round.myProposal,
+              otherProposal: round.otherProposal!,
+            },
+          });
+        } catch (e: any) {
+          log.error(`SYNTHESIS runner-up wait setup failed: ${e.message}`);
+        }
+      }
+      return;
     }
   }
 
