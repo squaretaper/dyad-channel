@@ -159,7 +159,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Supabase sends different notification IDs for the same INSERT (observed: 5x in 2ms).
   // TTLs must exceed STALE_THRESHOLD_MS (10 min) to survive reconnection replays.
   const DEDUP_TTL_MS = 720_000; // 12 min — ID-based, covers staleness watchdog + reconnect delay
-  const DEDUP_CONTENT_TTL_MS = 30_000; // 30s — content-based, only needs to catch ~8ms duplicate rows
+  const DEDUP_CONTENT_TTL_MS = 5_000; // 5s — content-based, only needs to catch ~8ms duplicate rows
   const seenMessageIds = new Set<string>();
   const seenContentKeys = new Set<string>();
   const seenCoordIds = new Set<string>();
