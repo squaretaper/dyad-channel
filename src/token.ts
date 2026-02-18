@@ -22,6 +22,10 @@ export interface DyadBotToken {
   pwd?: string;
   /** Dyad API URL (optional, e.g. https://dyadai.vercel.app) */
   apiUrl?: string;
+  /** Coordination chat ID (UUID) — the #coordination channel for the workspace */
+  coordChatId?: string;
+  /** API bearer token (dyad_xxx format) — for bot/message HTTP API auth */
+  apiToken?: string;
   /** Issuer (optional, always "dyad") */
   iss?: string;
   /** Issued at timestamp (optional) */
@@ -90,6 +94,8 @@ export function decodeBotToken(encoded: string): DyadBotToken {
     email: parsed.email,
     pwd: parsed.pwd,
     apiUrl: parsed.apiUrl,
+    coordChatId: parsed.coordChatId,
+    apiToken: parsed.apiToken,
     iss: parsed.iss ?? "dyad",
     iat: parsed.iat,
   };

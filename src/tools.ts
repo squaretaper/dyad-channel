@@ -10,6 +10,7 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
+import { decodeBotToken } from "./token.js";
 
 // ToolFactory isn't re-exported from plugin-sdk entry
 type ToolFactory = (ctx: { config?: any }) => AnyAgentTool | AnyAgentTool[] | null | undefined;
@@ -69,11 +70,19 @@ function readCoordConfig(ctx: { config?: any }): {
   apiUrl: string;
 } | null {
   const dyadCfg = (ctx.config?.channels as Record<string, any> | undefined)?.dyad;
-  const apiBotToken: string = dyadCfg?.token ?? "";
-  const coordChatId: string = dyadCfg?.coordChatId ?? "";
-  const apiUrl: string = dyadCfg?.apiUrl ?? "";
-  if (!apiBotToken || !coordChatId || !apiUrl) return null;
-  return { apiBotToken, coordChatId, apiUrl };
+  const rawToken: string = dyadCfg?.token ?? "";
+  if (!rawToken) return null;
+
+  try {
+    const decoded = decodeBotToken(rawToken);
+    const apiUrl = decoded.apiUrl ?? "";
+    const coordChatId = decoded.coordChatId ?? "";
+    const apiBotToken = decoded.apiToken ?? "";
+    if (!apiBotToken || !coordChatId || !apiUrl) return null;
+    return { apiBotToken, coordChatId, apiUrl };
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================
