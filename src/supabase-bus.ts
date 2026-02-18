@@ -123,7 +123,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
   // Dedup — dual-layer: ID-based + content-based
   const DEDUP_TTL_MS = 720_000; // 12 min
-  const DEDUP_CONTENT_TTL_MS = 5_000; // 5s
+  const DEDUP_CONTENT_TTL_MS = 30_000; // 30s (Sonnet routing can take 10s+)
   const seenMessageIds = new Set<string>();
   const seenContentKeys = new Set<string>();
 

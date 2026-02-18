@@ -236,7 +236,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             return;
           }
           seenMsgContent.add(msgKey);
-          setTimeout(() => seenMsgContent.delete(msgKey), 5_000);
+          setTimeout(() => seenMsgContent.delete(msgKey), 30_000);
 
           ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
 
