@@ -11,7 +11,6 @@ import {
   resolveDyadAccount,
   type ResolvedDyadAccount,
 } from "./types.js";
-import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -196,16 +195,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // Content-based dedup for onMessage
       const seenMsgContent = new Set<string>();
 
-      // doDispatch wrapper — set after bus is created
-      let doDispatchImpl: ((chatId: string, text: string, userId: string) => Promise<string>) | null = null;
-      const doDispatch = (chatId: string, text: string, userId: string): Promise<string> => {
-        if (!doDispatchImpl) {
-          return Promise.reject(new Error("doDispatch called before initialization"));
-        }
-        return doDispatchImpl(chatId, text, userId);
-      };
-
-      // Start bus — pure transport, no coordination
+      // Start bus — Realtime subscription for inbound messages + outbound delivery.
+      // Server-side dispatch route handles routing; plugin does NOT dispatch.
       ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
       const bus = await startDyadBus({
         supabaseUrl: account.supabaseUrl,
@@ -234,9 +225,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           setTimeout(() => seenMsgContent.delete(msgKey), 5_000);
 
           ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
-
-          // v4: dispatch immediately — server-side routing handles coordination
-          await doDispatch(chatId, text, userId);
+          // No-op: server-side dispatch route handles gateway dispatch
         },
         onError: (error, context) => {
           ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
@@ -248,62 +237,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
         },
       });
-
-      // Native dispatch helper (uses bus.sendMessage for delivery)
-      doDispatchImpl = async (chatId: string, text: string, userId: string): Promise<string> => {
-        const responseParts: string[] = [];
-        try {
-          const rt = getDyadRuntime();
-          ctx.log?.info(`${tag} Runtime OK (v${rt.version}), dispatching via native pipeline`);
-
-          const msgCtx = {
-            Body: text,
-            RawBody: text,
-            From: userId,
-            To: chatId,
-            SessionKey: `dyad:${chatId}`,
-            AccountId: account.accountId,
-            ChatType: "group",
-            Provider: "dyad",
-            Surface: "dyad",
-            OriginatingTo: chatId,
-            SenderId: userId,
-            CommandAuthorized: false,
-          };
-
-          const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-            ctx: msgCtx,
-            cfg: ctx.cfg,
-            dispatcherOptions: {
-              deliver: async (payload, { kind }) => {
-                ctx.log?.info(`${tag} Delivering ${kind} reply (text=${!!payload.text}, error=${!!payload.isError})`);
-                if (payload.text) {
-                  responseParts.push(payload.text);
-                  await bus.sendMessage(chatId, payload.text);
-                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars)`);
-                }
-              },
-              onError: (err, { kind }) => {
-                ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
-              },
-              onSkip: (payload, { kind, reason }) => {
-                ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}, text=${payload.text?.slice(0, 80)}`);
-              },
-            },
-          });
-
-          ctx.log?.info(
-            `${tag} Dispatch result: queuedFinal=${result.queuedFinal}, counts=${JSON.stringify(result.counts)}`,
-          );
-
-          if (!result.queuedFinal) {
-            ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
-          }
-        } catch (err: any) {
-          ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
-        }
-        return responseParts.join("\n");
-      };
 
       // Store the bus handle and signal readiness
       activeBuses.set(account.accountId, bus);
