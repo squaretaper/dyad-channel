@@ -84,6 +84,7 @@ export interface CoordinationHandlerOpts {
 
 const ROUND_TIMEOUT_MS = 15000;  // v3.5: must exceed Haiku timeout + Opus fallback
 const ROUND_CLEANUP_MS = 30000;  // v3.5: must exceed ROUND_TIMEOUT_MS
+const SOLO_WAIT_MS = 5000;      // After posting our proposal, wait this long for other bot
 const SEEN_TTL_MS = 720_000;     // 12 min — must exceed staleness watchdog (10 min)
 
 // ============================================================================
@@ -692,6 +693,17 @@ builds_on_other: Would your response be meaningfully better if you could read th
     if (activeRound.otherProposal && activeRound.otherName && !activeRound.resolved) {
       log.info(`Processing queued micro_propose from ${activeRound.otherName}`);
       await resolveRound(activeRound);
+    } else if (!activeRound.otherProposal && !activeRound.resolved) {
+      // No other proposal yet — start solo detection timer.
+      // If the other bot doesn't propose within SOLO_WAIT_MS, dispatch fail-open
+      // instead of waiting the full ROUND_TIMEOUT_MS.
+      setTimeout(() => {
+        const r = rounds.get(roundId);
+        if (r && !r.resolved && !r.otherProposal) {
+          log.warn(`Solo wait (${SOLO_WAIT_MS}ms) expired — no other proposal for round ${roundId.slice(0, 8)}, dispatching fail-open`);
+          handleTimeout(roundId).catch(e => log.error(`Solo timeout failed: ${e.message}`));
+        }
+      }, SOLO_WAIT_MS);
     }
   }
 

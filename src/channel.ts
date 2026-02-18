@@ -284,15 +284,35 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         return null;
       }
 
-      // --- Haiku micro-proposal caller (gateway model pass-through) ---
+      // --- Haiku micro-proposal caller (direct fetch, bypasses gateway semaphore) ---
       const HAIKU_MODEL = "anthropic/claude-haiku-4-5";
 
-      function callHaiku(prompt: string): Promise<string | null> {
-        return callGateway(prompt, 8000, {
-          model: HAIKU_MODEL,
-          sessionId: `micro:${Date.now()}`,  // stateless — no session accumulation
-          retries: 0,                         // fast fail → Opus fallback
-        });
+      async function callHaiku(prompt: string): Promise<string | null> {
+        if (gatewayStopped) return null;
+        try {
+          const res = await fetch(`${account.gatewayUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${account.gatewayToken}`,
+            },
+            body: JSON.stringify({
+              model: HAIKU_MODEL,
+              user: `micro:${Date.now()}`,
+              messages: [{ role: "user", content: prompt }],
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          if (!res.ok) {
+            ctx.log?.warn(`${tag} Haiku HTTP ${res.status}`);
+            return null;
+          }
+          const result = await res.json();
+          return result?.choices?.[0]?.message?.content?.trim() || null;
+        } catch (e: any) {
+          ctx.log?.warn(`${tag} Haiku call failed: ${e.message}`);
+          return null;
+        }
       }
 
       // --- In-memory state register (turn-taking context per chat) ---
@@ -463,7 +483,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.error(`${tag} Fallback dispatch failed for ${messageId.slice(0, 8)}: ${err.message}`);
                 });
               }
-            }, 10_000);
+            }, 25_000);
 
             pendingDispatches.set(messageId, { chatId, text, userId, timeoutId });
             ctx.log?.info(`${tag} Coordination enabled — holding dispatch for ${messageId.slice(0, 8)}, starting round`);
