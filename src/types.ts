@@ -6,6 +6,12 @@ export interface DyadAccountConfig {
   name?: string;
   token?: string;
   dmPolicy?: "open" | "disabled";
+  coordChatId?: string;
+  apiUrl?: string;
+  botToken?: string;
+  botName?: string;
+  gatewayUrl?: string;
+  gatewayToken?: string;
 }
 
 export interface ResolvedDyadAccount {
@@ -31,8 +37,18 @@ export interface ResolvedDyadAccount {
   botEmail: string;
   /** Bot password for Supabase auth (from token) */
   botPassword: string;
-  /** Bot display name (used as speaker identity in messages) */
+  /** Coordination chat ID (UUID) — null if coordination not configured */
+  coordChatId: string | null;
+  /** Dyad API URL for posting coordination messages */
+  apiUrl: string;
+  /** Hex API token for bot auth with Dyad API — null if not configured */
+  apiBotToken: string | null;
+  /** Bot display name for coordination speaker identity */
   botName: string;
+  /** OpenClaw gateway URL for LLM calls */
+  gatewayUrl: string;
+  /** OpenClaw gateway bearer token — null if not configured */
+  gatewayToken: string | null;
   /** Raw config */
   config: DyadAccountConfig;
 }
@@ -48,6 +64,8 @@ export function listDyadAccountIds(cfg: OpenClawConfig): string[] {
     | DyadAccountConfig
     | undefined;
 
+  // Always return default account if dyad config section exists
+  // isConfigured will determine if the token is valid
   if (dyadCfg) {
     return [DEFAULT_ACCOUNT_ID];
   }
@@ -98,7 +116,7 @@ export function resolveDyadAccount(opts: {
     enabled: baseEnabled,
     configured,
     botToken: rawToken.trim(),
-    appToken: rawToken.trim(),
+    appToken: rawToken.trim(), // Dyad uses single compound token for both
     decodedToken: botToken,
     botId: botToken?.sub ?? "",
     botUserId: botToken?.uid ?? "",
@@ -106,12 +124,23 @@ export function resolveDyadAccount(opts: {
     supabaseKey: botToken?.key ?? "",
     botEmail: botToken?.email ?? "",
     botPassword: botToken?.pwd ?? "",
-    botName: dyadCfg?.name?.trim() || "Bot",
+    coordChatId: dyadCfg?.coordChatId?.trim() || null,
+    apiUrl: dyadCfg?.apiUrl?.trim() || botToken?.apiUrl || "https://dyadai.vercel.app",
+    apiBotToken: dyadCfg?.botToken?.trim() || null,
+    botName: dyadCfg?.botName?.trim() || dyadCfg?.name?.trim() || "Bot",
+    gatewayUrl: dyadCfg?.gatewayUrl?.trim() || "http://localhost:18789",
+    gatewayToken: dyadCfg?.gatewayToken?.trim() || null,
     config: {
       enabled: dyadCfg?.enabled,
       name: dyadCfg?.name,
       token: dyadCfg?.token,
       dmPolicy: dyadCfg?.dmPolicy,
+      coordChatId: dyadCfg?.coordChatId,
+      apiUrl: dyadCfg?.apiUrl,
+      botToken: dyadCfg?.botToken,
+      botName: dyadCfg?.botName,
+      gatewayUrl: dyadCfg?.gatewayUrl,
+      gatewayToken: dyadCfg?.gatewayToken,
     },
   };
 }
