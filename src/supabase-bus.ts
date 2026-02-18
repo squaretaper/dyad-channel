@@ -140,6 +140,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
   // ============================================================================
   // Message subscription (claude_request messages)
+  //
+  // NOTE: "claude_request" is a legacy name from when Dyad's built-in Claude
+  // facilitator handled all responses. With BYOB (bring-your-own-bot), it
+  // really means "bot_request" — the bot could be any model. Not worth
+  // renaming in v4 (baked into schema, Realtime subscriptions, filters).
   // ============================================================================
 
   async function handleMessageEvent(payload: any): Promise<void> {
@@ -147,8 +152,10 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     try {
       const msg = payload.new as DyadMessage;
 
-      // Skip our own messages (prevent loops)
-      if (msg.user_id === botUserId) {
+      // v4 hybrid: the dispatch route INSERTs targeted claude_request
+      // messages with user_id = target bot's user_id. Only process
+      // messages addressed to THIS bot.
+      if (msg.user_id !== botUserId) {
         return;
       }
 
@@ -274,7 +281,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         if (error || !data) return;
 
         for (const msg of data) {
-          if (msg.user_id === botUserId) continue;
+          if (msg.user_id !== botUserId) continue; // only process messages addressed to this bot
           if (seenMessageIds.has(msg.id)) continue;
 
           onError(

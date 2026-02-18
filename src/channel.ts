@@ -11,6 +11,7 @@ import {
   resolveDyadAccount,
   type ResolvedDyadAccount,
 } from "./types.js";
+import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -195,8 +196,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       // Content-based dedup for onMessage
       const seenMsgContent = new Set<string>();
 
-      // Start bus — Realtime subscription for inbound messages + outbound delivery.
-      // Server-side dispatch route handles routing; plugin does NOT dispatch.
+      // v4 hybrid: the server-side dispatch route handles routing + RCD context
+      // injection, then INSERTs a targeted claude_request. The plugin picks it
+      // up via Realtime, dispatches through the OpenClaw runtime (which routes
+      // the response back through this Dyad channel's outbound), and delivers
+      // the reply via bus.sendMessage.
       ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
       const bus = await startDyadBus({
         supabaseUrl: account.supabaseUrl,
@@ -224,8 +228,52 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
           seenMsgContent.add(msgKey);
           setTimeout(() => seenMsgContent.delete(msgKey), 5_000);
 
-          ctx.log?.info(`${tag} Message from ${userId} in chat ${chatId}: ${text.slice(0, 50)}...`);
-          // No-op: server-side dispatch route handles gateway dispatch
+          ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
+
+          // Dispatch via OpenClaw runtime — response routes through Dyad outbound
+          try {
+            const rt = getDyadRuntime();
+
+            const msgCtx = {
+              Body: text,
+              RawBody: text,
+              From: userId,
+              To: chatId,
+              SessionKey: `dyad:${chatId}`,
+              AccountId: account.accountId,
+              ChatType: "group",
+              Provider: "dyad",
+              Surface: "dyad",
+              OriginatingTo: chatId,
+              SenderId: userId,
+              CommandAuthorized: false,
+            };
+
+            const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+              ctx: msgCtx,
+              cfg: ctx.cfg,
+              dispatcherOptions: {
+                deliver: async (payload: any, { kind }: any) => {
+                  if (payload.text) {
+                    await bus.sendMessage(chatId, payload.text);
+                    ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars, ${kind})`);
+                  }
+                },
+                onError: (err: any, { kind }: any) => {
+                  ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
+                },
+                onSkip: (payload: any, { kind, reason }: any) => {
+                  ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}`);
+                },
+              },
+            });
+
+            if (!result.queuedFinal) {
+              ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
+            }
+          } catch (err: any) {
+            ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
+          }
         },
         onError: (error, context) => {
           ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
