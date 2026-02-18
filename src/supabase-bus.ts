@@ -215,19 +215,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Health: staleness watchdog + DB keepalive
   // ============================================================================
 
-  intervals.push(
-    setInterval(() => {
-      const silentMs = Date.now() - lastEventTime;
-      if (silentMs > STALE_THRESHOLD_MS) {
-        onError(
-          new Error(`No events for ${Math.round(silentMs / 1000)}s — reconnecting broadcast`),
-          "staleness watchdog",
-        );
-        lastEventTime = Date.now();
-        subscribeDispatch();
-      }
-    }, HEALTH_CHECK_INTERVAL_MS),
-  );
+  // Staleness watchdog disabled — subscribeDispatch() on a stale WebSocket
+  // enters an infinite resubscribe loop because the new channel subscription
+  // never receives a SUBSCRIBED callback. The initial subscription is reliable;
+  // the watchdog was breaking it. TODO: replace with full Supabase client
+  // reconnect if true stale detection is needed.
 
   intervals.push(
     setInterval(async () => {
