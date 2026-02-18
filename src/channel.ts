@@ -295,10 +295,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
       // Return cleanup function
       return {
-        stop: () => {
-          bus.disconnect().catch((err) => {
-            ctx.log?.error(`${tag} Error disconnecting: ${err.message}`);
-          });
+        stop: async () => {
+          await bus.disconnect();
           activeBuses.delete(account.accountId);
           resetBusReady(account.accountId);
           ctx.log?.info(`${tag} Dyad provider stopped`);
