@@ -1,17 +1,15 @@
 /**
  * Supabase Realtime connection manager for Dyad channel plugin.
  *
- * Subscribes to INSERT events on the messages table filtered by message_type,
- * and provides a method to write bot responses back.
+ * Subscribes to INSERT/UPDATE events on the messages table filtered by
+ * message_type=claude_request, and provides a method to write bot responses back.
  *
- * Optionally subscribes to a second coordination channel for inter-agent
- * negotiation messages (Layer 1 + Layer 2).
+ * v4: Pure transport — no coordination subscription.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 // RealtimeChannel type — use ReturnType to avoid import issues across supabase-js versions
 type RealtimeChannel = ReturnType<SupabaseClient["channel"]>;
-import type { ParsedCoordinationMessage } from "./types-coordination.js";
 
 // ============================================================================
 // Types
@@ -56,26 +54,11 @@ export interface DyadBusOptions {
   onConnect?: () => void;
   /** Called on Realtime disconnection */
   onDisconnect?: () => void;
-
-  // --- Coordination (optional) ---
-
-  /** Coordination chat ID — enables coordination subscription */
-  coordChatId?: string;
-  /** Dyad API URL for posting coordination messages */
-  apiUrl?: string;
-  /** Hex API token for bot auth */
-  apiBotToken?: string;
-  /** Bot display name (used to filter own messages) */
-  botName?: string;
-  /** Called when a coordination message arrives */
-  onCoordinationMessage?: (msg: ParsedCoordinationMessage) => Promise<void>;
 }
 
 export interface DyadBusHandle {
   /** Send a text message to a chat */
   sendMessage: (chatId: string, content: string) => Promise<void>;
-  /** Send a coordination message to #coordination */
-  sendCoordination: (content: string) => Promise<void>;
   /** Disconnect from Supabase Realtime */
   disconnect: () => Promise<void>;
   /** Get the Supabase client (for advanced use) */
@@ -98,11 +81,9 @@ const RECONNECT_DELAY_MS = 5_000;
 /**
  * Start the Dyad Supabase Realtime bus.
  *
- * Subscribes to INSERT events on `public.messages` where
+ * Subscribes to INSERT/UPDATE events on `public.messages` where
  * `message_type=eq.claude_request` and routes to the onMessage callback.
  * No workspace filtering — responds to all messages (self-messages excluded).
- *
- * If coordChatId is provided, also subscribes to coordination messages.
  */
 export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle> {
   const {
@@ -117,11 +98,6 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     onError,
     onConnect,
     onDisconnect,
-    coordChatId,
-    apiUrl,
-    apiBotToken,
-    botName,
-    onCoordinationMessage,
   } = opts;
 
   // Create Supabase client
@@ -152,18 +128,12 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Subscription health tracking
   let lastEventTime = Date.now();
   let messageChannel: RealtimeChannel | null = null;
-  let coordChannel: RealtimeChannel | null = null;
 
   // Dedup for messages — dual-layer: ID-based + content-based
-  // ID-based catches exact row re-delivery. Content-based catches cases where
-  // Supabase sends different notification IDs for the same INSERT (observed: 5x in 2ms).
-  // TTLs must exceed STALE_THRESHOLD_MS (10 min) to survive reconnection replays.
-  const DEDUP_TTL_MS = 720_000; // 12 min — ID-based, covers staleness watchdog + reconnect delay
-  const DEDUP_CONTENT_TTL_MS = 5_000; // 5s — content-based, only needs to catch ~8ms duplicate rows
+  const DEDUP_TTL_MS = 720_000; // 12 min
+  const DEDUP_CONTENT_TTL_MS = 5_000; // 5s
   const seenMessageIds = new Set<string>();
   const seenContentKeys = new Set<string>();
-  const seenCoordIds = new Set<string>();
-  const seenCoordContentKeys = new Set<string>();
 
   // Interval handles for cleanup
   const intervals: ReturnType<typeof setInterval>[] = [];
@@ -172,8 +142,6 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Message subscription (claude_request messages)
   // ============================================================================
 
-  // Shared handler for both INSERT and UPDATE events on claude_request messages.
-  // UPDATE events fire when a user_message is reinvoked (type changed to claude_request).
   async function handleMessageEvent(payload: any): Promise<void> {
     lastEventTime = Date.now();
     try {
@@ -184,7 +152,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         return;
       }
 
-      // Dedup layer 1: ID-based (exact row re-delivery)
+      // Dedup layer 1: ID-based
       if (seenMessageIds.has(msg.id)) {
         onError(new Error(`Dedup(id): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
         return;
@@ -192,7 +160,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       seenMessageIds.add(msg.id);
       setTimeout(() => seenMessageIds.delete(msg.id), DEDUP_TTL_MS);
 
-      // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
+      // Dedup layer 2: content-based
       const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
       if (seenContentKeys.has(contentKey)) {
         onError(new Error(`Dedup(content): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
@@ -231,9 +199,6 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         },
         handleMessageEvent,
       )
-      // UPDATE subscription: catches reinvoke (user_message → claude_request).
-      // UPDATE Realtime events are less reliable than INSERT, but for a one-shot
-      // trigger like reinvoke this is acceptable — user can retry if missed.
       .on(
         "postgres_changes",
         {
@@ -257,88 +222,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   }
 
   // ============================================================================
-  // Coordination subscription (bot_coordination messages)
-  // ============================================================================
-
-  function subscribeCoordination(): void {
-    if (!coordChatId || !onCoordinationMessage) return;
-
-    if (coordChannel) {
-      supabase.removeChannel(coordChannel);
-    }
-
-    const channelName = `dyad-coord-${botName?.toLowerCase() || botId}-${Date.now()}`;
-    coordChannel = supabase
-      .channel(channelName)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `chat_id=eq.${coordChatId}`,
-        },
-        async (payload: any) => {
-          lastEventTime = Date.now();
-          try {
-            const msg = payload.new as DyadMessage;
-
-            // Only handle coordination messages
-            if (msg.message_type !== "bot_coordination") return;
-
-            // Skip own messages
-            if (botName && msg.speaker === botName) return;
-
-            // Dedup layer 1: ID-based
-            if (seenCoordIds.has(msg.id)) return;
-            seenCoordIds.add(msg.id);
-            setTimeout(() => seenCoordIds.delete(msg.id), DEDUP_TTL_MS);
-
-            // Parse content (needed for dedup key extraction)
-            let parsed: any = null;
-            try {
-              parsed = JSON.parse(msg.content);
-            } catch {
-              // Leave null — handler deals with unparseable messages
-            }
-
-            // Dedup layer 2: content-based (catches different notification IDs for same INSERT)
-            // Use round_id + kind + speaker for structured messages, fall back to content slice
-            const coordKey = parsed?.round_id
-              ? `${parsed.round_id}:${parsed.kind || parsed.intent?.type || "unknown"}:${msg.speaker}`
-              : `${msg.speaker}:${(msg.content || "").slice(0, 80)}`;
-            if (seenCoordContentKeys.has(coordKey)) return;
-            seenCoordContentKeys.add(coordKey);
-            setTimeout(() => seenCoordContentKeys.delete(coordKey), DEDUP_CONTENT_TTL_MS);
-
-            await onCoordinationMessage({
-              id: msg.id,
-              speaker: msg.speaker,
-              content: msg.content ?? "",
-              parsed,
-              messageType: msg.message_type,
-            });
-          } catch (err) {
-            onError(err as Error, "handle coordination message");
-          }
-        },
-      )
-      .subscribe((status: string, err?: Error) => {
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          onError(
-            new Error(`Coordination subscription ${status}${err ? `: ${err.message}` : ""}`),
-            "coordination subscribe",
-          );
-          setTimeout(() => subscribeCoordination(), RECONNECT_DELAY_MS);
-        }
-      });
-  }
-
-  // ============================================================================
   // Health: staleness watchdog + keepalive
   // ============================================================================
 
-  // Staleness watchdog: detect stale subscriptions and reconnect
   intervals.push(
     setInterval(() => {
       const silentMs = Date.now() - lastEventTime;
@@ -347,14 +233,12 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
           new Error(`No events for ${Math.round(silentMs / 1000)}s — reconnecting`),
           "staleness watchdog",
         );
-        lastEventTime = Date.now(); // reset to avoid rapid reconnect loops
+        lastEventTime = Date.now();
         subscribeMessages();
-        subscribeCoordination();
       }
     }, HEALTH_CHECK_INTERVAL_MS),
   );
 
-  // Keepalive: query DB periodically to keep Realtime connection warm
   intervals.push(
     setInterval(async () => {
       try {
@@ -372,9 +256,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     }, KEEPALIVE_INTERVAL_MS),
   );
 
-  // Polling fallback: catches Realtime misses (belt-and-suspenders).
-  // Every 5s, query recent claude_request messages and re-inject any
-  // that weren't delivered via Realtime. Dedup layers catch duplicates.
+  // Polling fallback: catches Realtime misses
   const POLL_INTERVAL_MS = 5_000;
   const POLL_LOOKBACK_MS = 30_000;
   intervals.push(
@@ -392,14 +274,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         if (error || !data) return;
 
         for (const msg of data) {
-          // Skip own messages
           if (msg.user_id === botUserId) continue;
-          // Dedup: if already seen by Realtime, the ID-based check will reject it.
-          // We still call onMessage — the upstream dedup layers (bus + channel)
-          // catch duplicates reliably.
           if (seenMessageIds.has(msg.id)) continue;
 
-          // This is a missed message — inject it
           onError(
             new Error(`Polling caught missed msg ${msg.id.slice(0, 8)}`),
             "polling fallback",
@@ -413,11 +290,10 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   );
 
   // ============================================================================
-  // Start subscriptions
+  // Start subscription
   // ============================================================================
 
   subscribeMessages();
-  subscribeCoordination();
 
   // ============================================================================
   // Public API
@@ -438,41 +314,15 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       }
     },
 
-    async sendCoordination(content: string): Promise<void> {
-      if (!coordChatId) {
-        throw new Error("Coordination not configured (missing coordChatId)");
-      }
-
-      // Direct Supabase insert — bot is signed in via auth, RLS allows insert as chat member.
-      // This bypasses the bot/message API route entirely (which had workspace_id validation issues).
-      const { error } = await supabase.from("messages").insert({
-        chat_id: coordChatId,
-        user_id: botUserId,
-        speaker: botDisplayName || "Bot",
-        content,
-        message_type: "bot_coordination",
-      });
-
-      if (error) {
-        throw new Error(`Failed to send coordination message: ${error.message}`);
-      }
-    },
-
     async disconnect(): Promise<void> {
-      // Clear all intervals
       for (const id of intervals) {
         clearInterval(id);
       }
       intervals.length = 0;
 
-      // Remove channels
       if (messageChannel) {
         await supabase.removeChannel(messageChannel);
         messageChannel = null;
-      }
-      if (coordChannel) {
-        await supabase.removeChannel(coordChannel);
-        coordChannel = null;
       }
     },
 
