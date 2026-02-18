@@ -1,10 +1,12 @@
 /**
  * Supabase Realtime connection manager for Dyad channel plugin.
  *
- * Subscribes to INSERT/UPDATE events on the messages table filtered by
- * message_type=claude_request, and provides a method to write bot responses back.
+ * v4 hybrid: Receives dispatch signals via Supabase Realtime Broadcast
+ * (ephemeral, no DB writes). Outbound bot responses written to `messages` table.
  *
- * v4: Pure transport — no coordination subscription.
+ * The server-side dispatch route handles routing + RCD context injection,
+ * then broadcasts to `bot-dispatch-{botId}`. This bus subscribes to that
+ * broadcast channel and invokes onMessage when a dispatch arrives.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
@@ -14,16 +16,6 @@ type RealtimeChannel = ReturnType<SupabaseClient["channel"]>;
 // ============================================================================
 // Types
 // ============================================================================
-
-export interface DyadMessage {
-  id: string;
-  chat_id: string;
-  user_id: string;
-  content: string;
-  message_type: string;
-  speaker: string;
-  created_at: string;
-}
 
 export interface DyadBusOptions {
   /** Supabase project URL */
@@ -40,7 +32,7 @@ export interface DyadBusOptions {
   botPassword?: string;
   /** Bot display name (used as speaker in messages) */
   botDisplayName?: string;
-  /** Called when a new message arrives for the bot */
+  /** Called when a dispatch signal arrives for this bot */
   onMessage: (msg: {
     chatId: string;
     text: string;
@@ -81,9 +73,9 @@ const RECONNECT_DELAY_MS = 5_000;
 /**
  * Start the Dyad Supabase Realtime bus.
  *
- * Subscribes to INSERT/UPDATE events on `public.messages` where
- * `message_type=eq.claude_request` and routes to the onMessage callback.
- * No workspace filtering — responds to all messages (self-messages excluded).
+ * Subscribes to a Broadcast channel `bot-dispatch-{botId}` for dispatch
+ * signals from the server-side dispatch route. Outbound responses are
+ * written to the `messages` table as `bot_response`.
  */
 export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle> {
   const {
@@ -127,9 +119,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
   // Subscription health tracking
   let lastEventTime = Date.now();
-  let messageChannel: RealtimeChannel | null = null;
+  let dispatchChannel: RealtimeChannel | null = null;
 
-  // Dedup for messages — dual-layer: ID-based + content-based
+  // Dedup — dual-layer: ID-based + content-based
   const DEDUP_TTL_MS = 720_000; // 12 min
   const DEDUP_CONTENT_TTL_MS = 5_000; // 5s
   const seenMessageIds = new Set<string>();
@@ -139,97 +131,88 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   const intervals: ReturnType<typeof setInterval>[] = [];
 
   // ============================================================================
-  // Message subscription (claude_request messages)
+  // Broadcast dispatch handler
   //
-  // NOTE: "claude_request" is a legacy name from when Dyad's built-in Claude
-  // facilitator handled all responses. With BYOB (bring-your-own-bot), it
-  // really means "bot_request" — the bot could be any model. Not worth
-  // renaming in v4 (baked into schema, Realtime subscriptions, filters).
+  // The server-side dispatch route broadcasts a signal per selected bot.
+  // Payload: { chatId, text, speaker, messageId }
   // ============================================================================
 
-  async function handleMessageEvent(payload: any): Promise<void> {
+  async function handleDispatchEvent(event: { payload: Record<string, unknown> }): Promise<void> {
     lastEventTime = Date.now();
     try {
-      const msg = payload.new as DyadMessage;
+      const { chatId, text, speaker, messageId } = (event.payload ?? {}) as {
+        chatId?: string;
+        text?: string;
+        speaker?: string;
+        messageId?: string;
+      };
 
-      // v4 hybrid: the dispatch route INSERTs targeted claude_request
-      // messages with user_id = target bot's user_id. Only process
-      // messages addressed to THIS bot.
-      if (msg.user_id !== botUserId) {
+      if (!chatId || !text || !messageId) {
+        onError(new Error(`Invalid dispatch payload: missing fields`), "dispatch");
         return;
       }
 
       // Dedup layer 1: ID-based
-      if (seenMessageIds.has(msg.id)) {
-        onError(new Error(`Dedup(id): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+      if (seenMessageIds.has(messageId)) {
+        onError(new Error(`Dedup(id): skipped duplicate dispatch ${messageId.slice(0, 8)}`), "dedup");
         return;
       }
-      seenMessageIds.add(msg.id);
-      setTimeout(() => seenMessageIds.delete(msg.id), DEDUP_TTL_MS);
+      seenMessageIds.add(messageId);
+      setTimeout(() => seenMessageIds.delete(messageId), DEDUP_TTL_MS);
 
       // Dedup layer 2: content-based
-      const contentKey = `${msg.chat_id}:${msg.user_id}:${(msg.content || "").slice(0, 80)}`;
+      const contentKey = `${chatId}:${speaker}:${(text || "").slice(0, 80)}`;
       if (seenContentKeys.has(contentKey)) {
-        onError(new Error(`Dedup(content): skipped duplicate msg ${msg.id.slice(0, 8)}`), "dedup");
+        onError(new Error(`Dedup(content): skipped duplicate dispatch ${messageId.slice(0, 8)}`), "dedup");
         return;
       }
       seenContentKeys.add(contentKey);
       setTimeout(() => seenContentKeys.delete(contentKey), DEDUP_CONTENT_TTL_MS);
 
       await onMessage({
-        chatId: msg.chat_id,
-        text: msg.content ?? "",
-        userId: msg.user_id,
-        messageId: msg.id,
-        speaker: msg.speaker ?? "",
+        chatId,
+        text,
+        userId: botUserId, // dispatch is addressed to this bot
+        messageId,
+        speaker: speaker ?? "",
       });
     } catch (err) {
-      onError(err as Error, "handle message");
+      onError(err as Error, "handle dispatch");
     }
   }
 
-  function subscribeMessages(): void {
-    if (messageChannel) {
-      supabase.removeChannel(messageChannel);
+  // ============================================================================
+  // Broadcast channel subscription
+  // ============================================================================
+
+  function subscribeDispatch(): void {
+    if (dispatchChannel) {
+      supabase.removeChannel(dispatchChannel);
     }
 
-    const channelName = `dyad-bot-${botId}-${Date.now()}`;
-    messageChannel = supabase
+    // Stable channel name — must match the dispatch route's broadcast target
+    const channelName = `bot-dispatch-${botId}`;
+    console.log(`[dyad-bus] Subscribing to broadcast channel: ${channelName}`);
+
+    dispatchChannel = supabase
       .channel(channelName)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: "message_type=eq.claude_request",
-        },
-        handleMessageEvent,
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "messages",
-          filter: "message_type=eq.claude_request",
-        },
-        handleMessageEvent,
-      )
+      .on("broadcast", { event: "dispatch" }, handleDispatchEvent)
       .subscribe((status: string) => {
         if (status === "SUBSCRIBED") {
+          console.log(`[dyad-bus] Broadcast channel subscribed: ${channelName}`);
           onConnect?.();
         } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn(`[dyad-bus] Broadcast channel ${status}: ${channelName}`);
           onDisconnect?.();
           if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-            setTimeout(() => subscribeMessages(), RECONNECT_DELAY_MS);
+            setTimeout(() => subscribeDispatch(), RECONNECT_DELAY_MS);
           }
         }
       });
   }
 
   // ============================================================================
-  // Health: staleness watchdog + keepalive
+  // Health: staleness watchdog + DB keepalive
   // ============================================================================
 
   intervals.push(
@@ -237,11 +220,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       const silentMs = Date.now() - lastEventTime;
       if (silentMs > STALE_THRESHOLD_MS) {
         onError(
-          new Error(`No events for ${Math.round(silentMs / 1000)}s — reconnecting`),
+          new Error(`No events for ${Math.round(silentMs / 1000)}s — reconnecting broadcast`),
           "staleness watchdog",
         );
         lastEventTime = Date.now();
-        subscribeMessages();
+        subscribeDispatch();
       }
     }, HEALTH_CHECK_INTERVAL_MS),
   );
@@ -263,44 +246,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     }, KEEPALIVE_INTERVAL_MS),
   );
 
-  // Polling fallback: catches Realtime misses
-  const POLL_INTERVAL_MS = 5_000;
-  const POLL_LOOKBACK_MS = 30_000;
-  intervals.push(
-    setInterval(async () => {
-      try {
-        const since = new Date(Date.now() - POLL_LOOKBACK_MS).toISOString();
-        const { data, error } = await supabase
-          .from("messages")
-          .select("*")
-          .eq("message_type", "claude_request")
-          .gt("created_at", since)
-          .order("created_at", { ascending: true })
-          .limit(10);
-
-        if (error || !data) return;
-
-        for (const msg of data) {
-          if (msg.user_id !== botUserId) continue; // only process messages addressed to this bot
-          if (seenMessageIds.has(msg.id)) continue;
-
-          onError(
-            new Error(`Polling caught missed msg ${msg.id.slice(0, 8)}`),
-            "polling fallback",
-          );
-          await handleMessageEvent({ new: msg });
-        }
-      } catch (e) {
-        onError(e as Error, "polling fallback");
-      }
-    }, POLL_INTERVAL_MS),
-  );
-
   // ============================================================================
   // Start subscription
   // ============================================================================
 
-  subscribeMessages();
+  subscribeDispatch();
 
   // ============================================================================
   // Public API
@@ -327,9 +277,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       }
       intervals.length = 0;
 
-      if (messageChannel) {
-        await supabase.removeChannel(messageChannel);
-        messageChannel = null;
+      if (dispatchChannel) {
+        await supabase.removeChannel(dispatchChannel);
+        dispatchChannel = null;
       }
     },
 

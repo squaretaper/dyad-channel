@@ -197,10 +197,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       const seenMsgContent = new Set<string>();
 
       // v4 hybrid: the server-side dispatch route handles routing + RCD context
-      // injection, then INSERTs a targeted claude_request. The plugin picks it
-      // up via Realtime, dispatches through the OpenClaw runtime (which routes
-      // the response back through this Dyad channel's outbound), and delivers
-      // the reply via bus.sendMessage.
+      // injection, then broadcasts a dispatch signal via Supabase Realtime
+      // Broadcast to `bot-dispatch-{botId}`. The plugin picks it up via the
+      // broadcast subscription, dispatches through the OpenClaw runtime (which
+      // routes the response back through this Dyad channel's outbound), and
+      // delivers the reply via bus.sendMessage.
       ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
       const bus = await startDyadBus({
         supabaseUrl: account.supabaseUrl,
