@@ -186,6 +186,15 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       });
       ctx.log?.info(`${tag} Starting Dyad provider`);
 
+      // Disconnect any stale bus from a previous start cycle (health-monitor restart)
+      const existingBus = activeBuses.get(account.accountId);
+      if (existingBus) {
+        ctx.log?.warn(`${tag} Cleaning up stale bus from previous start cycle`);
+        try { await existingBus.disconnect(); } catch (_) { /* best-effort */ }
+        activeBuses.delete(account.accountId);
+        resetBusReady(account.accountId);
+      }
+
       if (!account.configured || !account.decodedToken) {
         throw new Error("Dyad bot token not configured or invalid");
       }
@@ -291,17 +300,33 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       activeBuses.set(account.accountId, bus);
       markBusReady(account.accountId);
 
+      // Signal running status
+      ctx.setStatus({
+        accountId: account.accountId,
+        running: true,
+        lastStartAt: Date.now(),
+        lastError: null,
+      });
+
       ctx.log?.info(`${tag} Dyad provider started, listening for messages`);
 
-      // Return cleanup function
-      return {
-        stop: async () => {
+      // Keep the promise alive until abortSignal fires — resolving early
+      // makes the framework think the channel exited and triggers auto-restart.
+      return new Promise<void>((resolve) => {
+        const cleanup = async () => {
           await bus.disconnect();
           activeBuses.delete(account.accountId);
           resetBusReady(account.accountId);
           ctx.log?.info(`${tag} Dyad provider stopped`);
-        },
-      };
+          resolve();
+        };
+
+        if (ctx.abortSignal?.aborted) {
+          cleanup();
+        } else {
+          ctx.abortSignal?.addEventListener("abort", () => cleanup(), { once: true });
+        }
+      });
     },
   },
 };
