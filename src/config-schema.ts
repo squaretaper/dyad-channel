@@ -22,26 +22,6 @@ export const DyadConfigSchema = z.object({
    * For Dyad, default is "open" since workspace membership handles access control.
    */
   dmPolicy: z.enum(["open", "disabled"]).optional(),
-
-  // --- Coordination fields ---
-
-  /** Coordination chat ID (UUID of the #coordination chat) */
-  coordChatId: z.string().uuid().optional(),
-
-  /** Dyad API URL for posting coordination messages */
-  apiUrl: z.string().url().optional(),
-
-  /** Hex API token for bot authentication with the Dyad API */
-  botToken: z.string().optional(),
-
-  /** Bot display name (used as speaker identity in coordination) */
-  botName: z.string().optional(),
-
-  /** OpenClaw gateway URL for LLM calls */
-  gatewayUrl: z.string().url().optional(),
-
-  /** OpenClaw gateway bearer token */
-  gatewayToken: z.string().optional(),
 });
 
 export type DyadConfig = z.infer<typeof DyadConfigSchema>;
