@@ -51,10 +51,23 @@ export interface DyadBusOptions {
   onError: (error: Error, context: string) => void;
   onConnect?: () => void;
   onDisconnect?: () => void;
+  /** Coordination chat ID — enables inter-agent backchannel subscription */
+  coordChatId?: string;
+  /** Callback for inbound coordination messages from other agents */
+  onCoordinationMessage?: (msg: {
+    chatId: string;
+    text: string;
+    messageId: string;
+    speaker: string;
+    kind: string;
+    depth: number;
+    rawParsed: Record<string, unknown>;
+  }) => Promise<void>;
 }
 
 export interface DyadBusHandle {
   sendMessage: (chatId: string, content: string) => Promise<void>;
+  sendCoordinationMessage: (chatId: string, content: string) => Promise<void>;
   disconnect: () => Promise<void>;
   waitUntilDead: () => Promise<void>;
   client: SupabaseClient;
@@ -235,6 +248,101 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     });
 
   // ============================================================================
+  // Coordination channel subscription (inter-agent backchannel)
+  // ============================================================================
+
+  const MAX_COORDINATION_DEPTH = 4;
+  const VALID_COORD_KINDS = new Set(["question", "inform", "flag", "delegate", "status"]);
+  let coordChannel: RealtimeChannel | null = null;
+
+  if (opts.coordChatId && opts.onCoordinationMessage) {
+    const coordChatId = opts.coordChatId;
+    const coordChannelName = `coord-${botId}`;
+    console.log(`[dyad-bus] coordChatId: ${coordChatId.slice(0, 8)}… (coordination subscription active)`);
+
+    coordChannel = supabase
+      .channel(coordChannelName)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `chat_id=eq.${coordChatId}`,
+        },
+        async (payload: { new: Record<string, unknown> }) => {
+          try {
+            const msg = payload.new;
+            if (!msg) return;
+
+            // Filter 1: Only bot_coordination messages
+            if (msg.message_type !== "bot_coordination") return;
+
+            // Filter 2: Not from self
+            const speakerLower = (msg.speaker as string)?.toLowerCase();
+            if (speakerLower === botDisplayName?.toLowerCase()) return;
+
+            // Filter 3: Dedup
+            if (isDuplicate(msg.id as string)) return;
+
+            // Filter 4: Parse structured JSON content
+            let parsed: Record<string, unknown>;
+            try {
+              parsed = JSON.parse(msg.content as string);
+            } catch {
+              return; // Not valid structured JSON — skip
+            }
+
+            // Filter 5: Must be a known inter-agent message kind
+            const kind = parsed.kind as string;
+            if (!kind || !VALID_COORD_KINDS.has(kind)) return;
+
+            // Filter 6: Addressed to this bot or broadcast (no `to` field)
+            if (parsed.to && (parsed.to as string).toLowerCase() !== botDisplayName?.toLowerCase()) return;
+
+            // Filter 7: Depth cap
+            const depth = typeof parsed.depth === "number" ? parsed.depth : 0;
+            if (depth >= MAX_COORDINATION_DEPTH) {
+              console.log(`[dyad-bus] Coordination message dropped: depth=${depth} >= cap=${MAX_COORDINATION_DEPTH}`);
+              return;
+            }
+
+            // Format as readable text for the agent
+            const fromLabel = (msg.speaker as string) || "Unknown";
+            const kindLabel = kind === "question" ? "asks" : kind === "flag" ? "flags" : kind === "delegate" ? "delegates" : "says";
+            const toLabel = parsed.to ? ` (to ${parsed.to})` : "";
+            const depthLabel = depth > 0 ? ` [depth=${depth}]` : "";
+            const text = `[Coordination${toLabel}${depthLabel}] ${fromLabel} ${kindLabel}: ${parsed.content || ""}`;
+
+            console.log(`[dyad-bus] Coordination message from ${fromLabel}: ${kind} (depth=${depth})`);
+
+            await opts.onCoordinationMessage!({
+              chatId: coordChatId,
+              text,
+              messageId: msg.id as string,
+              speaker: msg.speaker as string,
+              kind,
+              depth,
+              rawParsed: parsed,
+            });
+          } catch (err) {
+            onError(err as Error, "coord-message");
+          }
+        },
+      )
+      .subscribe((status: string) => {
+        if (status === "SUBSCRIBED") {
+          console.log(`[dyad-bus] Coordination channel subscribed: ${coordChannelName}`);
+        } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          // Log but do NOT trigger deathResolve — coordination is secondary
+          console.warn(`[dyad-bus] Coordination channel ${status}: ${coordChannelName} (non-fatal)`);
+        }
+      });
+  } else {
+    console.log(`[dyad-bus] No coordChatId — coordination subscription skipped`);
+  }
+
+  // ============================================================================
   // DB keepalive — prevents idle connection timeout
   // ============================================================================
 
@@ -272,11 +380,29 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       }
     },
 
+    async sendCoordinationMessage(chatId: string, content: string): Promise<void> {
+      const { error } = await supabase.from("messages").insert({
+        chat_id: chatId,
+        user_id: botUserId,
+        speaker: botDisplayName || "Bot",
+        content,
+        message_type: "bot_coordination",
+      });
+
+      if (error) {
+        throw new Error(`Failed to send coordination message: ${error.message}`);
+      }
+    },
+
     async disconnect(): Promise<void> {
       stopPolling();
       if (keepaliveTimer) {
         clearInterval(keepaliveTimer);
         keepaliveTimer = null;
+      }
+      if (coordChannel) {
+        await supabase.removeChannel(coordChannel);
+        coordChannel = null;
       }
       if (dispatchChannel) {
         await supabase.removeChannel(dispatchChannel);

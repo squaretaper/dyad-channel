@@ -288,6 +288,65 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             onDisconnect: () => {
               ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
             },
+            // Inter-agent backchannel — subscribe to #coordination chat
+            coordChatId: account.decodedToken?.coordChatId,
+            onCoordinationMessage: async ({ chatId, text, messageId, speaker, kind, depth, rawParsed }) => {
+              ctx.log?.info(`${tag} Coordination from ${speaker}: ${kind} (depth=${depth})`);
+
+              try {
+                const rt = getDyadRuntime();
+
+                const msgCtx = {
+                  Body: text,
+                  RawBody: text,
+                  From: speaker,
+                  To: chatId,
+                  SessionKey: `dyad:coord:${chatId}`, // isolated from user chat sessions
+                  AccountId: account.accountId,
+                  ChatType: "group",
+                  Provider: "dyad",
+                  Surface: "dyad",
+                  OriginatingTo: chatId,
+                  SenderId: speaker,
+                  CommandAuthorized: false,
+                };
+
+                const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+                  ctx: msgCtx,
+                  cfg: ctx.cfg,
+                  dispatcherOptions: {
+                    deliver: async (payload: any, { kind: deliverKind }: any) => {
+                      if (payload.text) {
+                        // Reply as structured bot_coordination with depth+1
+                        const replyPayload = JSON.stringify({
+                          protocol: "dyad-coord-v2",
+                          kind: (rawParsed as any).kind === "question" ? "inform" : "status",
+                          to: speaker,
+                          content: payload.text,
+                          expects_reply: depth + 1 < 3,
+                          depth: depth + 1,
+                          source_chat_id: (rawParsed as any).source_chat_id || null,
+                        });
+                        await bus!.sendCoordinationMessage(chatId, replyPayload);
+                        ctx.log?.info(`${tag} Coordination reply sent to ${speaker} (depth=${depth + 1}, ${payload.text.length} chars, ${deliverKind})`);
+                      }
+                    },
+                    onError: (err: any, { kind: errKind }: any) => {
+                      ctx.log?.error(`${tag} Coordination dispatch error (${errKind}): ${err}`);
+                    },
+                    onSkip: (_payload: any, { kind: skipKind, reason }: any) => {
+                      ctx.log?.warn(`${tag} Coordination reply skipped (${skipKind}): reason=${reason}`);
+                    },
+                  },
+                });
+
+                if (!result.queuedFinal) {
+                  ctx.log?.warn(`${tag} No coordination reply generated for ${speaker}`);
+                }
+              } catch (err: any) {
+                ctx.log?.error(`${tag} Failed to process coordination message: ${err.message}`);
+              }
+            },
           });
 
           activeBuses.set(account.accountId, bus);
