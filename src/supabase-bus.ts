@@ -14,6 +14,13 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 type RealtimeChannel = ReturnType<SupabaseClient["channel"]>;
 
 // ============================================================================
+// Module-level dedup — persists across bus restarts, reconnects, and
+// stacked subscriptions. This is the last line of defence.
+// ============================================================================
+const GLOBAL_DEDUP_TTL_MS = 720_000; // 12 min
+const globalSeenIds = new Set<string>();
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -152,7 +159,14 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         return;
       }
 
-      // Dedup layer 1: ID-based
+      // Global dedup (module-level, survives bus restarts + stacked subscriptions)
+      if (globalSeenIds.has(messageId)) {
+        return; // silent — don't log, these are expected from stacked subscriptions
+      }
+      globalSeenIds.add(messageId);
+      setTimeout(() => globalSeenIds.delete(messageId), GLOBAL_DEDUP_TTL_MS);
+
+      // Dedup layer 1: ID-based (per-bus instance)
       if (seenMessageIds.has(messageId)) {
         onError(new Error(`Dedup(id): skipped duplicate dispatch ${messageId.slice(0, 8)}`), "dedup");
         return;
@@ -185,9 +199,14 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Broadcast channel subscription
   // ============================================================================
 
-  function subscribeDispatch(): void {
+  async function subscribeDispatch(): Promise<void> {
     if (dispatchChannel) {
-      supabase.removeChannel(dispatchChannel);
+      // MUST await — fire-and-forget removeChannel was the root cause of stacked
+      // subscriptions. Each unresolved removal left a ghost subscription on the
+      // Realtime server, so after N reconnects the bot had N active subscriptions
+      // all receiving the same broadcast independently.
+      try { await supabase.removeChannel(dispatchChannel); } catch (_) { /* best-effort */ }
+      dispatchChannel = null;
     }
 
     // Stable channel name — must match the dispatch route's broadcast target
@@ -273,6 +292,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         await supabase.removeChannel(dispatchChannel);
         dispatchChannel = null;
       }
+      // Belt-and-suspenders: remove ALL channels on this client to kill any
+      // ghost subscriptions left over from non-awaited removeChannel calls.
+      await supabase.removeAllChannels();
     },
 
     client: supabase,

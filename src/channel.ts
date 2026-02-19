@@ -15,6 +15,9 @@ import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
+// Module-level dedup — persists across startAccount restarts so stacked
+// bus instances can't independently process the same dispatch.
+const processedMessageIds = new Set<string>();
 // Bus readiness — gates outbound.sendText until startAccount completes.
 // Prevents "Outbound not configured" errors after SIGUSR1 restart.
 const busReadyPromises = new Map<string, { promise: Promise<void>; resolve: () => void }>();
@@ -198,9 +201,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
       if (!account.configured || !account.decodedToken) {
         throw new Error("Dyad bot token not configured or invalid");
       }
-
-      // Synchronous messageId guard — catches duplicate delivery regardless of cause
-      const processedMessageIds = new Set<string>();
 
       // Content-based dedup for onMessage
       const seenMsgContent = new Set<string>();
