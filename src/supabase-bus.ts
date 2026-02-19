@@ -1,45 +1,46 @@
 /**
- * Supabase Realtime connection manager for Dyad channel plugin.
+ * Supabase bus for Dyad channel plugin — v5 table-backed dispatch.
  *
- * v4 hybrid: Receives dispatch signals via Supabase Realtime Broadcast
- * (ephemeral, no DB writes). Outbound bot responses written to `messages` table.
+ * Architecture:
+ *   Dispatch route: INSERT pending_dispatches (durable) + broadcast (fast path)
+ *   Plugin:         broadcast delivers (~100ms) → claim row (CAS) → process
+ *                   poll every 5s (safety net)  → find unclaimed  → claim → process
+ *                   reconnect loop              → keeps WS alive for fast path
  *
- * The server-side dispatch route handles routing + RCD context injection,
- * then broadcasts to `bot-dispatch-{botId}`. This bus subscribes to that
- * broadcast channel and invokes onMessage when a dispatch arrives.
+ * Exactly-once: CAS row claim (UPDATE ... SET status='handled' WHERE status='pending')
+ * + module-level dedup Set. Only one path wins the claim; dedup catches any edge race.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-// RealtimeChannel type — use ReturnType to avoid import issues across supabase-js versions
+// RealtimeChannel type
 type RealtimeChannel = ReturnType<SupabaseClient["channel"]>;
 
 // ============================================================================
-// Module-level dedup — persists across bus restarts, reconnects, and
-// stacked subscriptions. This is the last line of defence.
+// Module-level dedup — persists across bus instances and reconnects.
+// This is the single dedup layer for the entire plugin.
 // ============================================================================
-const GLOBAL_DEDUP_TTL_MS = 720_000; // 12 min
-const globalSeenIds = new Set<string>();
+const processedIds = new Set<string>();
+const DEDUP_TTL_MS = 600_000; // 10 min
+
+function isDuplicate(messageId: string): boolean {
+  if (processedIds.has(messageId)) return true;
+  processedIds.add(messageId);
+  setTimeout(() => processedIds.delete(messageId), DEDUP_TTL_MS);
+  return false;
+}
 
 // ============================================================================
 // Types
 // ============================================================================
 
 export interface DyadBusOptions {
-  /** Supabase project URL */
   supabaseUrl: string;
-  /** Supabase anon key (RLS-scoped) */
   supabaseKey: string;
-  /** Bot ID (from bot_tokens) */
   botId: string;
-  /** Bot's user ID in Dyad (used as speaker identity) */
   botUserId: string;
-  /** Bot email for Supabase auth sign-in */
   botEmail?: string;
-  /** Bot password for Supabase auth sign-in */
   botPassword?: string;
-  /** Bot display name (used as speaker in messages) */
   botDisplayName?: string;
-  /** Called when a dispatch signal arrives for this bot */
   onMessage: (msg: {
     chatId: string;
     text: string;
@@ -47,20 +48,15 @@ export interface DyadBusOptions {
     messageId: string;
     speaker: string;
   }) => Promise<void>;
-  /** Called on errors */
   onError: (error: Error, context: string) => void;
-  /** Called when Realtime connection is established */
   onConnect?: () => void;
-  /** Called on Realtime disconnection */
   onDisconnect?: () => void;
 }
 
 export interface DyadBusHandle {
-  /** Send a text message to a chat */
   sendMessage: (chatId: string, content: string) => Promise<void>;
-  /** Disconnect from Supabase Realtime */
   disconnect: () => Promise<void>;
-  /** Get the Supabase client (for advanced use) */
+  waitUntilDead: () => Promise<void>;
   client: SupabaseClient;
 }
 
@@ -68,22 +64,13 @@ export interface DyadBusHandle {
 // Constants
 // ============================================================================
 
-const STALE_THRESHOLD_MS = 600_000; // 10 minutes without any event = stale
-const HEALTH_CHECK_INTERVAL_MS = 30_000; // check every 30s
-const KEEPALIVE_INTERVAL_MS = 60_000; // DB keepalive every 60s
-const RECONNECT_DELAY_MS = 5_000;
+const POLL_INTERVAL_MS = 5_000;
+const KEEPALIVE_INTERVAL_MS = 60_000;
 
 // ============================================================================
 // Main Bus
 // ============================================================================
 
-/**
- * Start the Dyad Supabase Realtime bus.
- *
- * Subscribes to a Broadcast channel `bot-dispatch-{botId}` for dispatch
- * signals from the server-side dispatch route. Outbound responses are
- * written to the `messages` table as `bot_response`.
- */
 export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle> {
   const {
     supabaseUrl,
@@ -99,16 +86,14 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     onDisconnect,
   } = opts;
 
-  // Create Supabase client
+  // Fresh Supabase client per bus instance (clean WS state on reconnect)
   const supabase = createClient(supabaseUrl, supabaseKey, {
     realtime: {
-      params: {
-        eventsPerSecond: 10,
-      },
+      params: { eventsPerSecond: 10 },
     },
   });
 
-  // Sign in as the bot user so Realtime subscriptions pass RLS
+  // Sign in as the bot user so RLS passes
   if (botEmail && botPassword) {
     console.log(`[dyad-bus] Attempting sign-in for ${botEmail}`);
     const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
@@ -121,32 +106,109 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       console.log(`[dyad-bus] Sign-in OK, user: ${signInData.user?.id}`);
     }
   } else {
-    console.log(`[dyad-bus] No botEmail/botPassword — skipping sign-in (email=${!!botEmail}, pwd=${!!botPassword})`);
+    console.log(`[dyad-bus] No botEmail/botPassword — skipping sign-in`);
   }
 
-  // Subscription health tracking
-  let lastEventTime = Date.now();
+  // Death signal — resolves when WS dies (reconnect loop in channel.ts restarts)
+  let deathResolve: (() => void) | null = null;
+  const deathPromise = new Promise<void>((r) => { deathResolve = r; });
+
   let dispatchChannel: RealtimeChannel | null = null;
-
-  // Dedup — dual-layer: ID-based + content-based
-  const DEDUP_TTL_MS = 720_000; // 12 min
-  const DEDUP_CONTENT_TTL_MS = 30_000; // 30s (Sonnet routing can take 10s+)
-  const seenMessageIds = new Set<string>();
-  const seenContentKeys = new Set<string>();
-
-  // Interval handles for cleanup
-  const intervals: ReturnType<typeof setInterval>[] = [];
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   // ============================================================================
-  // Broadcast dispatch handler
-  //
-  // The server-side dispatch route broadcasts a signal per selected bot.
-  // Payload: { chatId, text, speaker, messageId }
+  // CAS row claim — atomic, broadcast and poll can't both win
   // ============================================================================
 
-  async function handleDispatchEvent(event: { payload: Record<string, unknown> }): Promise<void> {
-    lastEventTime = Date.now();
+  async function claimAndProcess(
+    messageId: string,
+    payload: { chatId: string; text: string; speaker: string; messageId: string },
+  ): Promise<void> {
+    // Atomic claim: UPDATE only if status is still 'pending'
     try {
+      await supabase
+        .from("pending_dispatches")
+        .update({ status: "handled", handled_at: new Date().toISOString() })
+        .eq("bot_id", botId)
+        .eq("message_id", messageId)
+        .eq("status", "pending");
+    } catch (err) {
+      // CAS claim failed — log but don't block processing.
+      // Row may not exist yet (broadcast arrived before INSERT committed).
+      onError(err as Error, "cas-claim");
+    }
+
+    await onMessage({
+      chatId: payload.chatId,
+      text: payload.text,
+      userId: botUserId,
+      messageId: payload.messageId,
+      speaker: payload.speaker ?? "",
+    });
+  }
+
+  // ============================================================================
+  // Poll fallback — 5s safety net
+  // ============================================================================
+
+  async function pollPending(): Promise<void> {
+    try {
+      const { data } = await supabase
+        .from("pending_dispatches")
+        .select("*")
+        .eq("bot_id", botId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: true })
+        .limit(20);
+
+      for (const row of data || []) {
+        if (isDuplicate(row.message_id)) {
+          // Already processed via broadcast — just claim the row silently
+          await supabase
+            .from("pending_dispatches")
+            .update({ status: "handled", handled_at: new Date().toISOString() })
+            .eq("id", row.id)
+            .eq("status", "pending");
+          continue;
+        }
+        await claimAndProcess(row.message_id, row.payload);
+      }
+
+      // Cleanup: delete handled rows older than 1 hour
+      await supabase
+        .from("pending_dispatches")
+        .delete()
+        .eq("bot_id", botId)
+        .eq("status", "handled")
+        .lt("handled_at", new Date(Date.now() - 3_600_000).toISOString());
+    } catch (err) {
+      onError(err as Error, "poll");
+    }
+  }
+
+  function startPolling(): void {
+    pollPending(); // immediate drain
+    pollTimer = setInterval(() => pollPending(), POLL_INTERVAL_MS);
+  }
+
+  function stopPolling(): void {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  // ============================================================================
+  // Broadcast subscription (fast path)
+  // ============================================================================
+
+  const channelName = `bot-dispatch-${botId}`;
+  console.log(`[dyad-bus] Subscribing to broadcast channel: ${channelName}`);
+
+  dispatchChannel = supabase
+    .channel(channelName)
+    .on("broadcast", { event: "dispatch" }, async (event: { payload: Record<string, unknown> }) => {
       const { chatId, text, speaker, messageId } = (event.payload ?? {}) as {
         chatId?: string;
         text?: string;
@@ -154,114 +216,42 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         messageId?: string;
       };
 
-      if (!chatId || !text || !messageId) {
-        onError(new Error(`Invalid dispatch payload: missing fields`), "dispatch");
-        return;
-      }
+      if (!chatId || !text || !messageId) return;
+      if (isDuplicate(messageId)) return;
 
-      // Global dedup (module-level, survives bus restarts + stacked subscriptions)
-      if (globalSeenIds.has(messageId)) {
-        return; // silent — don't log, these are expected from stacked subscriptions
+      // CAS claim + process
+      await claimAndProcess(messageId, { chatId, text, speaker: speaker ?? "", messageId });
+    })
+    .subscribe((status: string) => {
+      if (status === "SUBSCRIBED") {
+        console.log(`[dyad-bus] Broadcast channel subscribed: ${channelName}`);
+        onConnect?.();
+        startPolling();
+      } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn(`[dyad-bus] Broadcast channel ${status}: ${channelName}`);
+        onDisconnect?.();
+        deathResolve?.();
       }
-      globalSeenIds.add(messageId);
-      setTimeout(() => globalSeenIds.delete(messageId), GLOBAL_DEDUP_TTL_MS);
+    });
 
-      // Dedup layer 1: ID-based (per-bus instance)
-      if (seenMessageIds.has(messageId)) {
-        onError(new Error(`Dedup(id): skipped duplicate dispatch ${messageId.slice(0, 8)}`), "dedup");
-        return;
+  // ============================================================================
+  // DB keepalive — prevents idle connection timeout
+  // ============================================================================
+
+  keepaliveTimer = setInterval(async () => {
+    try {
+      const { error } = await supabase
+        .from("bot_tokens")
+        .select("id")
+        .eq("id", botId)
+        .limit(1);
+      if (error) {
+        onError(new Error(error.message), "keepalive query");
       }
-      seenMessageIds.add(messageId);
-      setTimeout(() => seenMessageIds.delete(messageId), DEDUP_TTL_MS);
-
-      // Dedup layer 2: content-based
-      const contentKey = `${chatId}:${speaker}:${(text || "").slice(0, 80)}`;
-      if (seenContentKeys.has(contentKey)) {
-        onError(new Error(`Dedup(content): skipped duplicate dispatch ${messageId.slice(0, 8)}`), "dedup");
-        return;
-      }
-      seenContentKeys.add(contentKey);
-      setTimeout(() => seenContentKeys.delete(contentKey), DEDUP_CONTENT_TTL_MS);
-
-      await onMessage({
-        chatId,
-        text,
-        userId: botUserId, // dispatch is addressed to this bot
-        messageId,
-        speaker: speaker ?? "",
-      });
-    } catch (err) {
-      onError(err as Error, "handle dispatch");
+    } catch (e) {
+      onError(e as Error, "keepalive");
     }
-  }
-
-  // ============================================================================
-  // Broadcast channel subscription
-  // ============================================================================
-
-  async function subscribeDispatch(): Promise<void> {
-    if (dispatchChannel) {
-      // MUST await — fire-and-forget removeChannel was the root cause of stacked
-      // subscriptions. Each unresolved removal left a ghost subscription on the
-      // Realtime server, so after N reconnects the bot had N active subscriptions
-      // all receiving the same broadcast independently.
-      try { await supabase.removeChannel(dispatchChannel); } catch (_) { /* best-effort */ }
-      dispatchChannel = null;
-    }
-
-    // Stable channel name — must match the dispatch route's broadcast target
-    const channelName = `bot-dispatch-${botId}`;
-    console.log(`[dyad-bus] Subscribing to broadcast channel: ${channelName}`);
-
-    dispatchChannel = supabase
-      .channel(channelName)
-      .on("broadcast", { event: "dispatch" }, handleDispatchEvent)
-      .subscribe((status: string) => {
-        if (status === "SUBSCRIBED") {
-          console.log(`[dyad-bus] Broadcast channel subscribed: ${channelName}`);
-          onConnect?.();
-        } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          console.warn(`[dyad-bus] Broadcast channel ${status}: ${channelName}`);
-          onDisconnect?.();
-          if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-            setTimeout(() => subscribeDispatch(), RECONNECT_DELAY_MS);
-          }
-        }
-      });
-  }
-
-  // ============================================================================
-  // Health: staleness watchdog + DB keepalive
-  // ============================================================================
-
-  // Staleness watchdog disabled — subscribeDispatch() on a stale WebSocket
-  // enters an infinite resubscribe loop because the new channel subscription
-  // never receives a SUBSCRIBED callback. The initial subscription is reliable;
-  // the watchdog was breaking it. TODO: replace with full Supabase client
-  // reconnect if true stale detection is needed.
-
-  intervals.push(
-    setInterval(async () => {
-      try {
-        const { error } = await supabase
-          .from("bot_tokens")
-          .select("id")
-          .eq("id", botId)
-          .limit(1);
-        if (error) {
-          onError(new Error(error.message), "keepalive query");
-        }
-      } catch (e) {
-        onError(e as Error, "keepalive");
-      }
-    }, KEEPALIVE_INTERVAL_MS),
-  );
-
-  // ============================================================================
-  // Start subscription
-  // ============================================================================
-
-  subscribeDispatch();
+  }, KEEPALIVE_INTERVAL_MS);
 
   // ============================================================================
   // Public API
@@ -283,19 +273,19 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     },
 
     async disconnect(): Promise<void> {
-      for (const id of intervals) {
-        clearInterval(id);
+      stopPolling();
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
       }
-      intervals.length = 0;
-
       if (dispatchChannel) {
         await supabase.removeChannel(dispatchChannel);
         dispatchChannel = null;
       }
-      // Belt-and-suspenders: remove ALL channels on this client to kill any
-      // ghost subscriptions left over from non-awaited removeChannel calls.
       await supabase.removeAllChannels();
     },
+
+    waitUntilDead: () => deathPromise,
 
     client: supabase,
   };

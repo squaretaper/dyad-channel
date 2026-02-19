@@ -15,9 +15,6 @@ import { getDyadRuntime } from "./runtime.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
-// Module-level dedup — persists across startAccount restarts so stacked
-// bus instances can't independently process the same dispatch.
-const processedMessageIds = new Set<string>();
 // Bus readiness — gates outbound.sendText until startAccount completes.
 // Prevents "Outbound not configured" errors after SIGUSR1 restart.
 const busReadyPromises = new Map<string, { promise: Promise<void>; resolve: () => void }>();
@@ -42,6 +39,25 @@ function markBusReady(accountId: string): void {
 
 function resetBusReady(accountId: string): void {
   busReadyPromises.delete(accountId);
+}
+
+// ============================================================================
+// Backoff utilities (inline — no external deps)
+// ============================================================================
+
+interface BackoffPolicy { initialMs: number; maxMs: number; factor: number; jitter: number; }
+
+function computeBackoff(p: BackoffPolicy, attempt: number): number {
+  const base = Math.min(p.initialMs * Math.pow(p.factor, attempt - 1), p.maxMs);
+  return base + base * p.jitter * (Math.random() * 2 - 1);
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((r) => {
+    if (signal?.aborted) { r(); return; }
+    const t = setTimeout(r, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true });
+  });
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -184,12 +200,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
     startAccount: async (ctx) => {
       const account = ctx.account;
       const tag = `[${account.accountId}]`;
-      ctx.setStatus({
-        accountId: account.accountId,
-      });
-      ctx.log?.info(`${tag} Starting Dyad provider`);
+      ctx.setStatus({ accountId: account.accountId });
+      ctx.log?.info(`${tag} Starting Dyad provider (v5 table-backed dispatch)`);
 
-      // Disconnect any stale bus from a previous start cycle (health-monitor restart)
+      // Disconnect any stale bus from a previous start cycle
       const existingBus = activeBuses.get(account.accountId);
       if (existingBus) {
         ctx.log?.warn(`${tag} Cleaning up stale bus from previous start cycle`);
@@ -202,131 +216,109 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         throw new Error("Dyad bot token not configured or invalid");
       }
 
-      // Content-based dedup for onMessage
-      const seenMsgContent = new Set<string>();
+      // Reconnect loop — keeps WS alive for fast-path broadcast,
+      // poll continues as safety net. On WS death, reconnect with backoff.
+      const BACKOFF: BackoffPolicy = { initialMs: 2_000, maxMs: 60_000, factor: 2, jitter: 0.2 };
+      let attempts = 0;
 
-      // v4 hybrid: the server-side dispatch route handles routing + RCD context
-      // injection, then broadcasts a dispatch signal via Supabase Realtime
-      // Broadcast to `bot-dispatch-{botId}`. The plugin picks it up via the
-      // broadcast subscription, dispatches through the OpenClaw runtime (which
-      // routes the response back through this Dyad channel's outbound), and
-      // delivers the reply via bus.sendMessage.
-      ctx.log?.info(`${tag} Bot identity: name="${account.botName}", userId=${account.botUserId}`);
-      const bus = await startDyadBus({
-        supabaseUrl: account.supabaseUrl,
-        supabaseKey: account.supabaseKey,
-        botId: account.botId,
-        botUserId: account.botUserId,
-        botEmail: account.botEmail,
-        botPassword: account.botPassword,
-        botDisplayName: account.botName,
-        onMessage: async ({ chatId, text, userId, messageId }) => {
-          // Absolute first guard — synchronous messageId check
-          if (processedMessageIds.has(messageId)) {
-            ctx.log?.warn(`${tag} MessageId dedup: skipped ${messageId.slice(0, 8)}`);
-            return;
-          }
-          processedMessageIds.add(messageId);
-          setTimeout(() => processedMessageIds.delete(messageId), 600_000);
+      while (!ctx.abortSignal?.aborted) {
+        let bus: DyadBusHandle | null = null;
+        try {
+          bus = await startDyadBus({
+            supabaseUrl: account.supabaseUrl,
+            supabaseKey: account.supabaseKey,
+            botId: account.botId,
+            botUserId: account.botUserId,
+            botEmail: account.botEmail,
+            botPassword: account.botPassword,
+            botDisplayName: account.botName,
+            onMessage: async ({ chatId, text, userId, messageId, speaker }) => {
+              ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
 
-          // Content-based dedup
-          const msgKey = `${chatId}:${userId}:${text.slice(0, 80)}`;
-          if (seenMsgContent.has(msgKey)) {
-            ctx.log?.warn(`${tag} Content dedup: skipped duplicate for ${messageId.slice(0, 8)}`);
-            return;
-          }
-          seenMsgContent.add(msgKey);
-          setTimeout(() => seenMsgContent.delete(msgKey), 30_000);
+              try {
+                const rt = getDyadRuntime();
 
-          ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
+                const msgCtx = {
+                  Body: text,
+                  RawBody: text,
+                  From: userId,
+                  To: chatId,
+                  SessionKey: `dyad:${chatId}`,
+                  AccountId: account.accountId,
+                  ChatType: "group",
+                  Provider: "dyad",
+                  Surface: "dyad",
+                  OriginatingTo: chatId,
+                  SenderId: userId,
+                  CommandAuthorized: false,
+                };
 
-          // Dispatch via OpenClaw runtime — response routes through Dyad outbound
-          try {
-            const rt = getDyadRuntime();
+                const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+                  ctx: msgCtx,
+                  cfg: ctx.cfg,
+                  dispatcherOptions: {
+                    deliver: async (payload: any, { kind }: any) => {
+                      if (payload.text) {
+                        await bus!.sendMessage(chatId, payload.text);
+                        ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars, ${kind})`);
+                      }
+                    },
+                    onError: (err: any, { kind }: any) => {
+                      ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
+                    },
+                    onSkip: (payload: any, { kind, reason }: any) => {
+                      ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}`);
+                    },
+                  },
+                });
 
-            const msgCtx = {
-              Body: text,
-              RawBody: text,
-              From: userId,
-              To: chatId,
-              SessionKey: `dyad:${chatId}`,
-              AccountId: account.accountId,
-              ChatType: "group",
-              Provider: "dyad",
-              Surface: "dyad",
-              OriginatingTo: chatId,
-              SenderId: userId,
-              CommandAuthorized: false,
-            };
+                if (!result.queuedFinal) {
+                  ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
+                }
+              } catch (err: any) {
+                ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
+              }
+            },
+            onError: (error, context) => {
+              ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
+            },
+            onConnect: () => {
+              ctx.log?.info(`${tag} Connected to Supabase Realtime`);
+            },
+            onDisconnect: () => {
+              ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
+            },
+          });
 
-            const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-              ctx: msgCtx,
-              cfg: ctx.cfg,
-              dispatcherOptions: {
-                deliver: async (payload: any, { kind }: any) => {
-                  if (payload.text) {
-                    await bus.sendMessage(chatId, payload.text);
-                    ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars, ${kind})`);
-                  }
-                },
-                onError: (err: any, { kind }: any) => {
-                  ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
-                },
-                onSkip: (payload: any, { kind, reason }: any) => {
-                  ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}`);
-                },
-              },
-            });
+          activeBuses.set(account.accountId, bus);
+          markBusReady(account.accountId);
+          ctx.setStatus({ accountId: account.accountId, running: true, lastStartAt: Date.now(), lastError: null });
+          attempts = 0;
+          ctx.log?.info(`${tag} Connected — broadcast + poll active`);
 
-            if (!result.queuedFinal) {
-              ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
-            }
-          } catch (err: any) {
-            ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
-          }
-        },
-        onError: (error, context) => {
-          ctx.log?.error(`${tag} Dyad error (${context}): ${error.message}`);
-        },
-        onConnect: () => {
-          ctx.log?.info(`${tag} Connected to Supabase Realtime`);
-        },
-        onDisconnect: () => {
-          ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
-        },
-      });
-
-      // Store the bus handle and signal readiness
-      activeBuses.set(account.accountId, bus);
-      markBusReady(account.accountId);
-
-      // Signal running status
-      ctx.setStatus({
-        accountId: account.accountId,
-        running: true,
-        lastStartAt: Date.now(),
-        lastError: null,
-      });
-
-      ctx.log?.info(`${tag} Dyad provider started, listening for messages`);
-
-      // Keep the promise alive until abortSignal fires — resolving early
-      // makes the framework think the channel exited and triggers auto-restart.
-      return new Promise<void>((resolve) => {
-        const cleanup = async () => {
-          await bus.disconnect();
-          activeBuses.delete(account.accountId);
-          resetBusReady(account.accountId);
-          ctx.log?.info(`${tag} Dyad provider stopped`);
-          resolve();
-        };
-
-        if (ctx.abortSignal?.aborted) {
-          cleanup();
-        } else {
-          ctx.abortSignal?.addEventListener("abort", () => cleanup(), { once: true });
+          // Block until WS dies (poll keeps running independently)
+          await bus.waitUntilDead();
+          ctx.log?.warn(`${tag} WS died, reconnecting for fast-path...`);
+        } catch (err: any) {
+          ctx.log?.error(`${tag} Connection error: ${err.message}`);
+          ctx.setStatus({ accountId: account.accountId, lastError: err.message });
         }
-      });
+
+        // Cleanup before reconnect
+        if (bus) {
+          try { await bus.disconnect(); } catch (_) { /* best-effort */ }
+        }
+        activeBuses.delete(account.accountId);
+        resetBusReady(account.accountId);
+        if (ctx.abortSignal?.aborted) break;
+
+        attempts++;
+        const delayMs = computeBackoff(BACKOFF, attempts);
+        ctx.log?.info(`${tag} Reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${attempts})`);
+        await sleepWithAbort(delayMs, ctx.abortSignal);
+      }
+
+      ctx.log?.info(`${tag} Dyad provider stopped (aborted)`);
     },
   },
 };
