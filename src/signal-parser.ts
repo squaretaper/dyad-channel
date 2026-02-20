@@ -29,7 +29,7 @@ export function parseCoordinationSignal(text: string): {
   );
   if (blockMatch) {
     const signal = parseTextBlock(blockMatch[1]);
-    const cleanText = text.replace(blockMatch[0], "").trim();
+    const cleanText = sanitizeTrailingMarkdown(text.replace(blockMatch[0], "").trim());
     return { signal, cleanText };
   }
 
@@ -42,7 +42,7 @@ export function parseCoordinationSignal(text: string): {
       const raw = JSON.parse(commentMatch[1]) as Record<string, unknown>;
       const signal = normalizeSignal(raw);
       if (signal) {
-        const cleanText = text.replace(commentMatch[0], "").trim();
+        const cleanText = sanitizeTrailingMarkdown(text.replace(commentMatch[0], "").trim());
         return { signal, cleanText };
       }
     } catch {
@@ -52,6 +52,22 @@ export function parseCoordinationSignal(text: string): {
 
   // No signal found — per spec §6.2, this is an emission error in v5.0
   return { signal: null, cleanText: text };
+}
+
+/**
+ * Sanitize trailing unclosed markdown after stripping the coordination block.
+ * When agents write "the `foo` function and the `" before their coordination
+ * block, stripping leaves an orphaned backtick that breaks markdown rendering.
+ */
+function sanitizeTrailingMarkdown(text: string): string {
+  // Count backticks — if odd, the last one is unclosed
+  const backtickCount = (text.match(/`/g) || []).length;
+  if (backtickCount % 2 !== 0) {
+    // Remove the trailing orphaned backtick
+    const lastIdx = text.lastIndexOf('`');
+    text = text.slice(0, lastIdx) + text.slice(lastIdx + 1);
+  }
+  return text.trimEnd();
 }
 
 function parseTextBlock(block: string): CoordinationSignal | null {
