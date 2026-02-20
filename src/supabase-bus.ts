@@ -266,7 +266,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // ============================================================================
 
   const MAX_COORDINATION_DEPTH = 4;
-  const VALID_COORD_KINDS = new Set(["question", "inform", "flag", "delegate", "status"]);
+  const VALID_COORD_KINDS = new Set(["question", "inform", "flag", "delegate", "status", "signal"]);
   let coordChannel: RealtimeChannel | null = null;
 
   if (opts.coordChatId && opts.onCoordinationMessage) {

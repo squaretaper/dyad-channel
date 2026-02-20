@@ -12,6 +12,7 @@ import {
   type ResolvedDyadAccount,
 } from "./types.js";
 import { getDyadRuntime } from "./runtime.js";
+import { parseCoordinationSignal } from "./signal-parser.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -259,8 +260,46 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   dispatcherOptions: {
                     deliver: async (payload: any, { kind }: any) => {
                       if (payload.text) {
-                        await bus!.sendMessage(chatId, payload.text);
-                        ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${payload.text.length} chars, ${kind})`);
+                        // Parse and strip coordination signal before delivering
+                        const { signal, cleanText } = parseCoordinationSignal(payload.text);
+
+                        // [NOTHING_FROM_ME] handling (v5 spec §10.3):
+                        // Agent decided silence is the right call. Suppress public delivery.
+                        const isNothingFromMe = cleanText.trim() === "[NOTHING_FROM_ME]" ||
+                          cleanText.trim().startsWith("[NOTHING_FROM_ME]");
+                        if (isNothingFromMe) {
+                          ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
+                        } else {
+                          // Deliver stripped response to chat
+                          await bus!.sendMessage(chatId, cleanText);
+                          ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${cleanText.length} chars, ${kind})`);
+                        }
+
+                        // Post signal to coordination channel (shadow mode — logged only)
+                        if (signal && bus && account.decodedToken?.coordChatId) {
+                          const signalPayload = JSON.stringify({
+                            protocol: "dyad-coord-v2",
+                            kind: "signal",
+                            agent: account.botName,
+                            solo_insufficient: signal.solo_insufficient,
+                            confidence: signal.confidence,
+                            reason: signal.reason,
+                            suggested_angle: signal.suggested_angle,
+                            basis: signal.basis,
+                            chain_depth: signal.chain_depth,
+                            source_chat_id: chatId,
+                            display: signal.display || `${account.botName}: solo_insufficient=${signal.solo_insufficient} (${signal.confidence})`,
+                          });
+                          await bus.sendCoordinationMessage(
+                            account.decodedToken.coordChatId,
+                            signalPayload,
+                          ).catch((err: any) =>
+                            ctx.log?.warn(`${tag} Failed to post signal: ${err.message}`),
+                          );
+                          ctx.log?.info(`${tag} [coord] Signal posted: solo_insufficient=${signal.solo_insufficient}, confidence=${signal.confidence}`);
+                        } else if (!signal) {
+                          ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
+                        }
                       }
                     },
                     onError: (err: any, { kind }: any) => {
@@ -292,6 +331,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             coordChatId: account.decodedToken?.coordChatId,
             onCoordinationMessage: async ({ chatId, text, messageId, speaker, kind, depth, rawParsed }) => {
               ctx.log?.info(`${tag} Coordination from ${speaker}: ${kind} (depth=${depth})`);
+
+              // Skip signal messages — they're informational, not actionable (Phase 1 shadow mode)
+              if (kind === "signal") return;
 
               try {
                 const rt = getDyadRuntime();
