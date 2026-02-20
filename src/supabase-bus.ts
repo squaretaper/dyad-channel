@@ -122,6 +122,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
     console.log(`[dyad-bus] No botEmail/botPassword — skipping sign-in`);
   }
 
+  // Boot timestamp — skip any messages created before this bus instance started.
+  // Prevents replaying stale dispatches/coordination from before a gateway restart.
+  const bootTime = new Date().toISOString();
+  console.log(`[dyad-bus] Boot time: ${bootTime}`);
+
   // Death signal — resolves when WS dies (reconnect loop in channel.ts restarts)
   let deathResolve: (() => void) | null = null;
   const deathPromise = new Promise<void>((r) => { deathResolve = r; });
@@ -167,11 +172,20 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
   async function pollPending(): Promise<void> {
     try {
+      // Bulk-mark stale rows from before this bus booted as handled (don't process them)
+      await supabase
+        .from("pending_dispatches")
+        .update({ status: "handled", handled_at: new Date().toISOString() })
+        .eq("bot_id", botId)
+        .eq("status", "pending")
+        .lt("created_at", bootTime);
+
       const { data } = await supabase
         .from("pending_dispatches")
         .select("*")
         .eq("bot_id", botId)
         .eq("status", "pending")
+        .gte("created_at", bootTime)
         .order("created_at", { ascending: true })
         .limit(20);
 
@@ -274,6 +288,9 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
           try {
             const msg = payload.new;
             if (!msg) return;
+
+            // Filter 0: Skip messages from before this bus booted (stale WAL replay)
+            if (msg.created_at && (msg.created_at as string) < bootTime) return;
 
             // Filter 1: Only bot_coordination messages
             if (msg.message_type !== "bot_coordination") return;
