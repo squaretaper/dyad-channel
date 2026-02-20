@@ -296,17 +296,21 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
               try {
                 const rt = getDyadRuntime();
 
+                // Use the source chat's session so the agent has full user conversation context.
+                // Falls back to coordination chat ID for broadcast messages without a source.
+                const sourceChatId = (rawParsed as any).source_chat_id || chatId;
+
                 const msgCtx = {
                   Body: text,
                   RawBody: text,
                   From: speaker,
-                  To: chatId,
-                  SessionKey: `dyad:coord:${chatId}`, // isolated from user chat sessions
+                  To: sourceChatId,
+                  SessionKey: `dyad:${sourceChatId}`,
                   AccountId: account.accountId,
                   ChatType: "group",
                   Provider: "dyad",
                   Surface: "dyad",
-                  OriginatingTo: chatId,
+                  OriginatingTo: sourceChatId,
                   SenderId: speaker,
                   CommandAuthorized: false,
                 };
