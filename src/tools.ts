@@ -75,9 +75,11 @@ function readCoordConfig(ctx: { config?: any }): {
 
   try {
     const decoded = decodeBotToken(rawToken);
-    const apiUrl = decoded.apiUrl ?? "";
-    const coordChatId = decoded.coordChatId ?? "";
-    const apiBotToken = decoded.apiToken ?? "";
+    // Fall back to flat config fields if the token was generated before
+    // coordChatId/apiUrl/apiToken were added to the token payload.
+    const coordChatId = decoded.coordChatId ?? dyadCfg?.coordChatId ?? "";
+    const apiUrl = decoded.apiUrl ?? dyadCfg?.apiUrl ?? "";
+    const apiBotToken = decoded.apiToken ?? dyadCfg?.botToken ?? "";
     if (!apiBotToken || !coordChatId || !apiUrl) return null;
     return { apiBotToken, coordChatId, apiUrl };
   } catch {
