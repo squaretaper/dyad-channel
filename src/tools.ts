@@ -292,6 +292,13 @@ export function createCoordHistoryTool(): ToolFactory {
               ) {
                 const toLabel = parsed.to ? ` → ${parsed.to}` : "";
                 summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 150)}`;
+              } else if (parsed.kind === "signal") {
+                const si = parsed.solo_insufficient ? "TRUE" : "false";
+                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence}, reason: "${(parsed.reason || "").slice(0, 200)}"`;
+              } else if (parsed.kind === "judgment_trace") {
+                summary = `[chain_trace] depth=${parsed.chain_depth}, ended: ${parsed.termination_reason}, ${parsed.display || ""}`;
+              } else if (parsed.kind === "routing_decision") {
+                summary = `[routing] route=${parsed.route}, source=${parsed.source}, confidence=${parsed.confidence}`;
               } else {
                 summary = msg.content.slice(0, 150);
               }
