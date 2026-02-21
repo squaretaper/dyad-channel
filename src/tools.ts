@@ -268,6 +268,19 @@ export function createCoordHistoryTool(): ToolFactory {
             let summary: string;
             try {
               const parsed = JSON.parse(msg.content);
+
+              // Handle agent_response envelope (v8 structured format)
+              if (msg.message_type === "agent_response" && parsed.content !== undefined && parsed.messages) {
+                const sigMsg = (parsed.messages as any[]).find((m: any) => m.kind === "signal");
+                if (sigMsg) {
+                  const si = sigMsg.payload?.solo_insufficient ? "TRUE" : "false";
+                  summary = `[agent_response] signal: solo_insufficient=${si}, confidence=${sigMsg.confidence ?? "n/a"}, content=${(parsed.content || "").slice(0, 80)}…`;
+                } else {
+                  summary = `[agent_response] content=${(parsed.content || "").slice(0, 120)}…`;
+                }
+                return `${msg.speaker} (${ts}): ${summary}`;
+              }
+
               if (parsed.intent?.type === "round_start") {
                 summary = `[round_start] trigger: "${(parsed.trigger_content || "").slice(0, 100)}"`;
               } else if (parsed.kind === "propose") {

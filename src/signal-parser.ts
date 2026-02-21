@@ -1,4 +1,8 @@
 /**
+ * @deprecated — Phase 1 dual-format: kept for old-path signal extraction.
+ * Will be removed once dispatch route fully migrates to AgentResponse envelopes.
+ * New code should use buildAgentResponse() from agent-types.ts instead.
+ *
  * Coordination signal parser — dual-format support.
  *
  * Parses [COORDINATION]...[/COORDINATION] text blocks and

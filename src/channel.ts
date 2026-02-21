@@ -13,6 +13,7 @@ import {
 } from "./types.js";
 import { getDyadRuntime } from "./runtime.js";
 import { parseCoordinationSignal } from "./signal-parser.js";
+import { buildAgentResponse } from "./agent-types.js";
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -311,7 +312,21 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
                 }
 
-                // Send one combined public message
+                // ---- New path: post AgentResponse envelope (dual-format) ----
+                const agentResponse = buildAgentResponse(
+                  finalText,
+                  signal,
+                  account.botName,
+                  chatId,
+                );
+                if (bus) {
+                  await bus.sendAgentResponse(chatId, agentResponse).catch((err: any) =>
+                    ctx.log?.warn(`${tag} Failed to post agent_response: ${err.message}`),
+                  );
+                  ctx.log?.info(`${tag} [agent_response] posted for chat ${chatId} (${agentResponse.messages.length} messages)`);
+                }
+
+                // Send one combined public message (old path — kept for backward compat)
                 const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
                   finalText.startsWith("[NOTHING_FROM_ME]");
 

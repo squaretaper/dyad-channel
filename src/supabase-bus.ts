@@ -70,6 +70,7 @@ export interface DyadBusOptions {
 export interface DyadBusHandle {
   sendMessage: (chatId: string, content: string) => Promise<void>;
   sendCoordinationMessage: (chatId: string, content: string) => Promise<void>;
+  sendAgentResponse: (chatId: string, response: import("./agent-types.js").AgentResponse) => Promise<void>;
   disconnect: () => Promise<void>;
   waitUntilDead: () => Promise<void>;
   client: SupabaseClient;
@@ -416,6 +417,20 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
 
       if (error) {
         throw new Error(`Failed to send coordination message: ${error.message}`);
+      }
+    },
+
+    async sendAgentResponse(chatId: string, response: import("./agent-types.js").AgentResponse): Promise<void> {
+      const { error } = await supabase.from("messages").insert({
+        chat_id: chatId,
+        user_id: botUserId,
+        speaker: botDisplayName || "Bot",
+        content: JSON.stringify(response),
+        message_type: "agent_response",
+      });
+
+      if (error) {
+        throw new Error(`Failed to send agent_response: ${error.message}`);
       }
     },
 
