@@ -278,21 +278,14 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
                 }
 
-                // ---- Post-dispatch: parse full text, send one combined message ----
+                // ---- Post-dispatch: parse full text once ----
+                ctx.log?.info(`${tag} Accumulated ${accumulatedRaw.length} raw chars for chat ${chatId}`);
                 const { signal, cleanText } = parseCoordinationSignal(accumulatedRaw);
                 const finalText = cleanText.trim();
 
-                const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
-                  finalText.startsWith("[NOTHING_FROM_ME]");
-
-                if (isNothingFromMe) {
-                  ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
-                } else if (finalText) {
-                  await bus!.sendMessage(chatId, finalText);
-                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, combined)`);
-                }
-
-                // Post signal to coordination channel
+                // Post signal FIRST — dispatch route polls coordination channel
+                // with 45s timeout; sending signal before public message minimizes
+                // the window where the poll might time out on slow responses.
                 if (signal && bus && account.decodedToken?.coordChatId) {
                   const signalPayload = JSON.stringify({
                     protocol: "dyad-coord-v2",
@@ -316,6 +309,19 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.info(`${tag} [coord] Signal posted: solo_insufficient=${signal.solo_insufficient}, confidence=${signal.confidence}`);
                 } else if (!signal) {
                   ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
+                }
+
+                // Send one combined public message
+                const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
+                  finalText.startsWith("[NOTHING_FROM_ME]");
+
+                if (isNothingFromMe) {
+                  ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
+                } else if (finalText) {
+                  await bus!.sendMessage(chatId, finalText);
+                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, combined)`);
+                } else {
+                  ctx.log?.warn(`${tag} Empty public text after signal stripping (raw=${accumulatedRaw.length} chars) — no message sent for chat ${chatId}`);
                 }
               } catch (err: any) {
                 ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
