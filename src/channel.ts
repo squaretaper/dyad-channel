@@ -391,7 +391,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                     kind: (rawParsed as any).kind === "question" ? "inform" : "status",
                     to: speaker,
                     content: coordText,
-                    expects_reply: depth + 1 < 3,
+                    expects_reply: depth + 1 < (account.config.maxCoordinationDepth ?? 4) - 1,
                     depth: depth + 1,
                     source_chat_id: (rawParsed as any).source_chat_id || null,
                   });
