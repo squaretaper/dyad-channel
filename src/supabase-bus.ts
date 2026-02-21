@@ -53,6 +53,8 @@ export interface DyadBusOptions {
   onDisconnect?: () => void;
   /** Coordination chat ID — enables inter-agent backchannel subscription */
   coordChatId?: string;
+  /** Max coordination chain depth (default 4) */
+  maxCoordinationDepth?: number;
   /** Callback for inbound coordination messages from other agents */
   onCoordinationMessage?: (msg: {
     chatId: string;
@@ -265,7 +267,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Coordination channel subscription (inter-agent backchannel)
   // ============================================================================
 
-  const MAX_COORDINATION_DEPTH = 4;
+  const MAX_COORDINATION_DEPTH = opts.maxCoordinationDepth ?? 4;
   const VALID_COORD_KINDS = new Set(["question", "inform", "flag", "delegate", "status", "signal"]);
   let coordChannel: RealtimeChannel | null = null;
 
@@ -324,11 +326,17 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
 
+            // Filter 8: Respect expects_reply=false — sender indicated no reply wanted
+            if (parsed.expects_reply === false) {
+              console.log(`[dyad-bus] Coordination message skipped: expects_reply=false (depth=${depth})`);
+              return;
+            }
+
             // Format as readable text for the agent
             const fromLabel = (msg.speaker as string) || "Unknown";
             const kindLabel = kind === "question" ? "asks" : kind === "flag" ? "flags" : kind === "delegate" ? "delegates" : "says";
             const toLabel = parsed.to ? ` (to ${parsed.to})` : "";
-            const depthLabel = depth > 0 ? ` [depth=${depth}]` : "";
+            const depthLabel = ` [depth=${depth}/${MAX_COORDINATION_DEPTH}]`;
             const text = `[Coordination${toLabel}${depthLabel}] ${fromLabel} ${kindLabel}: ${parsed.content || ""}`;
 
             console.log(`[dyad-bus] Coordination message from ${fromLabel}: ${kind} (depth=${depth})`);

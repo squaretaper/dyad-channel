@@ -294,9 +294,9 @@ export function createCoordHistoryTool(): ToolFactory {
                 summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 150)}`;
               } else if (parsed.kind === "signal") {
                 const si = parsed.solo_insufficient ? "TRUE" : "false";
-                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence}, reason: "${(parsed.reason || "").slice(0, 200)}"`;
+                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence ?? "n/a"}, reason: "${(parsed.reason || "").slice(0, 200)}"`;
               } else if (parsed.kind === "judgment_trace") {
-                summary = `[chain_trace] depth=${parsed.chain_depth}, ended: ${parsed.termination_reason}, ${parsed.display || ""}`;
+                summary = `[chain_trace] depth=${parsed.chain_depth ?? "?"}, ended: ${parsed.termination_reason || "unknown"}, ${parsed.display || ""}`;
               } else if (parsed.kind === "routing_decision") {
                 summary = `[routing] route=${parsed.route}, source=${parsed.source}, confidence=${parsed.confidence}`;
               } else {

@@ -233,6 +233,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             botEmail: account.botEmail,
             botPassword: account.botPassword,
             botDisplayName: account.botName,
+            maxCoordinationDepth: account.config.maxCoordinationDepth,
             onMessage: async ({ chatId, text, userId, messageId, speaker }) => {
               ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
 
@@ -254,53 +255,15 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   CommandAuthorized: false,
                 };
 
+                // Accumulate all chunks, parse + send once after dispatch completes
+                let accumulatedRaw = "";
+
                 const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
                   ctx: msgCtx,
                   cfg: ctx.cfg,
                   dispatcherOptions: {
                     deliver: async (payload: any, { kind }: any) => {
-                      if (payload.text) {
-                        // Parse and strip coordination signal before delivering
-                        const { signal, cleanText } = parseCoordinationSignal(payload.text);
-
-                        // [NOTHING_FROM_ME] handling (v5 spec §10.3):
-                        // Agent decided silence is the right call. Suppress public delivery.
-                        const isNothingFromMe = cleanText.trim() === "[NOTHING_FROM_ME]" ||
-                          cleanText.trim().startsWith("[NOTHING_FROM_ME]");
-                        if (isNothingFromMe) {
-                          ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
-                        } else {
-                          // Deliver stripped response to chat
-                          await bus!.sendMessage(chatId, cleanText);
-                          ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${cleanText.length} chars, ${kind})`);
-                        }
-
-                        // Post signal to coordination channel (shadow mode — logged only)
-                        if (signal && bus && account.decodedToken?.coordChatId) {
-                          const signalPayload = JSON.stringify({
-                            protocol: "dyad-coord-v2",
-                            kind: "signal",
-                            agent: account.botName,
-                            solo_insufficient: signal.solo_insufficient,
-                            confidence: signal.confidence,
-                            reason: signal.reason,
-                            suggested_angle: signal.suggested_angle,
-                            basis: signal.basis,
-                            chain_depth: signal.chain_depth,
-                            source_chat_id: chatId,
-                            display: signal.display || `${account.botName}: solo_insufficient=${signal.solo_insufficient} (${signal.confidence})`,
-                          });
-                          await bus.sendCoordinationMessage(
-                            account.decodedToken.coordChatId,
-                            signalPayload,
-                          ).catch((err: any) =>
-                            ctx.log?.warn(`${tag} Failed to post signal: ${err.message}`),
-                          );
-                          ctx.log?.info(`${tag} [coord] Signal posted: solo_insufficient=${signal.solo_insufficient}, confidence=${signal.confidence}`);
-                        } else if (!signal) {
-                          ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
-                        }
-                      }
+                      if (payload.text) accumulatedRaw += payload.text;
                     },
                     onError: (err: any, { kind }: any) => {
                       ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
@@ -313,6 +276,46 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
                 if (!result.queuedFinal) {
                   ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
+                }
+
+                // ---- Post-dispatch: parse full text, send one combined message ----
+                const { signal, cleanText } = parseCoordinationSignal(accumulatedRaw);
+                const finalText = cleanText.trim();
+
+                const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
+                  finalText.startsWith("[NOTHING_FROM_ME]");
+
+                if (isNothingFromMe) {
+                  ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
+                } else if (finalText) {
+                  await bus!.sendMessage(chatId, finalText);
+                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, combined)`);
+                }
+
+                // Post signal to coordination channel
+                if (signal && bus && account.decodedToken?.coordChatId) {
+                  const signalPayload = JSON.stringify({
+                    protocol: "dyad-coord-v2",
+                    kind: "signal",
+                    agent: account.botName,
+                    solo_insufficient: signal.solo_insufficient,
+                    confidence: signal.confidence,
+                    reason: signal.reason,
+                    suggested_angle: signal.suggested_angle,
+                    basis: signal.basis,
+                    chain_depth: signal.chain_depth,
+                    source_chat_id: chatId,
+                    display: signal.display || `${account.botName}: solo_insufficient=${signal.solo_insufficient} (${signal.confidence})`,
+                  });
+                  await bus.sendCoordinationMessage(
+                    account.decodedToken.coordChatId,
+                    signalPayload,
+                  ).catch((err: any) =>
+                    ctx.log?.warn(`${tag} Failed to post signal: ${err.message}`),
+                  );
+                  ctx.log?.info(`${tag} [coord] Signal posted: solo_insufficient=${signal.solo_insufficient}, confidence=${signal.confidence}`);
+                } else if (!signal) {
+                  ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
                 }
               } catch (err: any) {
                 ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
@@ -357,25 +360,15 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   CommandAuthorized: false,
                 };
 
+                // Accumulate coordination reply chunks, send one combined message
+                let coordAccumulated = "";
+
                 const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
                   ctx: msgCtx,
                   cfg: ctx.cfg,
                   dispatcherOptions: {
                     deliver: async (payload: any, { kind: deliverKind }: any) => {
-                      if (payload.text) {
-                        // Reply as structured bot_coordination with depth+1
-                        const replyPayload = JSON.stringify({
-                          protocol: "dyad-coord-v2",
-                          kind: (rawParsed as any).kind === "question" ? "inform" : "status",
-                          to: speaker,
-                          content: payload.text,
-                          expects_reply: depth + 1 < 3,
-                          depth: depth + 1,
-                          source_chat_id: (rawParsed as any).source_chat_id || null,
-                        });
-                        await bus!.sendCoordinationMessage(chatId, replyPayload);
-                        ctx.log?.info(`${tag} Coordination reply sent to ${speaker} (depth=${depth + 1}, ${payload.text.length} chars, ${deliverKind})`);
-                      }
+                      if (payload.text) coordAccumulated += payload.text;
                     },
                     onError: (err: any, { kind: errKind }: any) => {
                       ctx.log?.error(`${tag} Coordination dispatch error (${errKind}): ${err}`);
@@ -388,6 +381,22 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
                 if (!result.queuedFinal) {
                   ctx.log?.warn(`${tag} No coordination reply generated for ${speaker}`);
+                }
+
+                // ---- Post-dispatch: send one combined coordination reply ----
+                const coordText = coordAccumulated.trim();
+                if (coordText) {
+                  const replyPayload = JSON.stringify({
+                    protocol: "dyad-coord-v2",
+                    kind: (rawParsed as any).kind === "question" ? "inform" : "status",
+                    to: speaker,
+                    content: coordText,
+                    expects_reply: depth + 1 < 3,
+                    depth: depth + 1,
+                    source_chat_id: (rawParsed as any).source_chat_id || null,
+                  });
+                  await bus!.sendCoordinationMessage(chatId, replyPayload);
+                  ctx.log?.info(`${tag} Coordination reply sent to ${speaker} (depth=${depth + 1}, ${coordText.length} chars, combined)`);
                 }
               } catch (err: any) {
                 ctx.log?.error(`${tag} Failed to process coordination message: ${err.message}`);

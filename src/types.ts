@@ -6,6 +6,8 @@ export interface DyadAccountConfig {
   name?: string;
   token?: string;
   dmPolicy?: "open" | "disabled";
+  maxCoordinationDepth?: number;
+  confidenceFalloff?: number[];
 }
 
 export interface ResolvedDyadAccount {
@@ -112,6 +114,8 @@ export function resolveDyadAccount(opts: {
       name: dyadCfg?.name,
       token: dyadCfg?.token,
       dmPolicy: dyadCfg?.dmPolicy,
+      maxCoordinationDepth: dyadCfg?.maxCoordinationDepth,
+      confidenceFalloff: dyadCfg?.confidenceFalloff,
     },
   };
 }
