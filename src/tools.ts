@@ -205,6 +205,8 @@ export function createCoordHistoryTool(): ToolFactory {
         try {
           const url = new URL(`${coord.apiUrl}/api/v2/bot/message`);
           url.searchParams.set("chat_id", coord.coordChatId);
+          url.searchParams.set("limit", String(limit));
+          url.searchParams.set("message_type", "bot_coordination,agent_response");
           if (params.since) {
             url.searchParams.set("since", params.since);
           }
@@ -231,7 +233,7 @@ export function createCoordHistoryTool(): ToolFactory {
           const data = await res.json();
           const messages: any[] = data.messages || [];
 
-          let recent = messages.slice(-limit);
+          let recent = messages; // API handles limit + type filtering
 
           if (params.source_chat_id) {
             recent = recent.filter((msg: any) => {
@@ -274,15 +276,15 @@ export function createCoordHistoryTool(): ToolFactory {
                 const sigMsg = (parsed.messages as any[]).find((m: any) => m.kind === "signal");
                 if (sigMsg) {
                   const si = sigMsg.payload?.solo_insufficient ? "TRUE" : "false";
-                  summary = `[agent_response] signal: solo_insufficient=${si}, confidence=${sigMsg.confidence ?? "n/a"}, content=${(parsed.content || "").slice(0, 80)}…`;
+                  summary = `[agent_response] signal: solo_insufficient=${si}, confidence=${sigMsg.confidence ?? "n/a"}, content=${(parsed.content || "").slice(0, 150)}…`;
                 } else {
-                  summary = `[agent_response] content=${(parsed.content || "").slice(0, 120)}…`;
+                  summary = `[agent_response] content=${(parsed.content || "").slice(0, 200)}…`;
                 }
                 return `${msg.speaker} (${ts}): ${summary}`;
               }
 
               if (parsed.intent?.type === "round_start") {
-                summary = `[round_start] trigger: "${(parsed.trigger_content || "").slice(0, 100)}"`;
+                summary = `[round_start] trigger: "${(parsed.trigger_content || "").slice(0, 150)}"`;
               } else if (parsed.kind === "propose") {
                 summary = `[propose] angle: "${parsed.proposal?.angle || ""}", covers: [${(parsed.proposal?.covers || []).join(", ")}]`;
               } else if (parsed.kind === "accept") {
@@ -290,33 +292,35 @@ export function createCoordHistoryTool(): ToolFactory {
               } else if (parsed.kind === "counter") {
                 summary = `[counter] angle: "${parsed.proposal?.angle || ""}"`;
               } else if (parsed.kind === "ready") {
-                summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 100)}"`;
+                summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 150)}"`;
               } else if (parsed.kind === "micro_propose") {
                 summary = `[micro_propose] angle: "${parsed.proposal?.angle || ""}", confidence: ${parsed.proposal?.confidence ?? "n/a"}`;
               } else if (parsed.kind === "resolved") {
                 const runnerUpLabel = parsed.runner_up ? `, runner_up: ${parsed.runner_up}` : "";
-                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}${runnerUpLabel}, reason: "${(parsed.reason || "").slice(0, 100)}"`;
+                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}${runnerUpLabel}, reason: "${(parsed.reason || "").slice(0, 150)}"`;
               } else if (parsed.kind === "response_summary") {
-                summary = `[response_summary] "${(parsed.content || "").slice(0, 150)}"`;
+                summary = `[response_summary] "${(parsed.content || "").slice(0, 250)}"`;
               } else if (
                 ["question", "inform", "flag", "delegate", "status"].includes(
                   parsed.kind,
                 )
               ) {
                 const toLabel = parsed.to ? ` → ${parsed.to}` : "";
-                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 150)}`;
+                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 250)}`;
               } else if (parsed.kind === "signal") {
                 const si = parsed.solo_insufficient ? "TRUE" : "false";
-                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence ?? "n/a"}, reason: "${(parsed.reason || "").slice(0, 200)}"`;
+                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence ?? "n/a"}, reason: "${(parsed.reason || "").slice(0, 300)}"`;
               } else if (parsed.kind === "judgment_trace") {
                 summary = `[chain_trace] depth=${parsed.chain_depth ?? "?"}, ended: ${parsed.termination_reason || "unknown"}, ${parsed.display || ""}`;
               } else if (parsed.kind === "routing_decision") {
                 summary = `[routing] route=${parsed.route}, source=${parsed.source}, confidence=${parsed.confidence}`;
+              } else if (parsed.kind === "soft_dispatch_defer") {
+                summary = `[soft_dispatch_defer] ${parsed.agent || "unknown"}: dispatched but deferred — nothing differentiated to add`;
               } else {
-                summary = msg.content.slice(0, 150);
+                summary = msg.content.slice(0, 250);
               }
             } catch {
-              summary = msg.content.slice(0, 150);
+              summary = msg.content.slice(0, 250);
             }
 
             return `${msg.speaker} (${ts}): ${summary}`;

@@ -338,6 +338,23 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
                 if (isNothingFromMe) {
                   ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
+                  // Post coordination trace so demotion+defer is distinguishable from never-dispatched
+                  if (bus && account.decodedToken?.coordChatId) {
+                    const deferPayload = JSON.stringify({
+                      protocol: "dyad-coord-v2",
+                      kind: "soft_dispatch_defer",
+                      agent: account.botName,
+                      source_chat_id: chatId,
+                      reason: "Agent dispatched (soft) but had nothing differentiated to add.",
+                      display: `${account.botName}: [NOTHING_FROM_ME] — soft dispatch deferred`,
+                    });
+                    await bus.sendCoordinationMessage(
+                      account.decodedToken.coordChatId,
+                      deferPayload,
+                    ).catch((err: any) =>
+                      ctx.log?.warn(`${tag} Failed to post soft_dispatch_defer: ${err.message}`),
+                    );
+                  }
                 } else if (finalText) {
                   await bus!.sendMessage(chatId, finalText);
                   ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, combined)`);
