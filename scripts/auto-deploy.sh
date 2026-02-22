@@ -10,7 +10,7 @@
 # need a full process restart to load new compiled JS.
 set -euo pipefail
 
-REPO_DIR="/Users/joshua/projects/dyad/dyad-channel"
+REPO_DIR="/Users/joshua/projects/dyad/dyad"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"
 LOG="/Users/joshua/clawd/logs/dyad-autodeploy.log"
 
@@ -64,12 +64,10 @@ while true; do
     continue
   fi
 
-  # Check for new commits
-  LOCAL=$(git rev-parse HEAD)
-  REMOTE=$(git rev-parse origin/main)
+  # Check for new commits on remote that we don't have locally
+  NEW_COMMITS=$(git log --oneline HEAD..origin/main 2>/dev/null)
 
-  if [ "$LOCAL" != "$REMOTE" ]; then
-    NEW_COMMITS=$(git log --oneline HEAD..origin/main)
+  if [ -n "$NEW_COMMITS" ]; then
     log "New commits detected:"
     log "$NEW_COMMITS"
 

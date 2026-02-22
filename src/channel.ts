@@ -122,6 +122,12 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
   outbound: {
     deliveryMode: "direct",
     textChunkLimit: 10000,
+    sendMedia: async ({ to, accountId }) => {
+      // Dyad is text-only (MVP). The standard outbound path requires sendMedia
+      // to be defined, but actual media delivery is not supported.
+      // Return a success result so the delivery system doesn't error.
+      return { channel: "dyad" as const, messageId: "", to };
+    },
     sendText: async ({ to, text, accountId }) => {
       const aid = accountId ?? DEFAULT_ACCOUNT_ID;
 
