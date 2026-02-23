@@ -226,7 +226,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
       // Reconnect loop — keeps WS alive for fast-path broadcast,
       // poll continues as safety net. On WS death, reconnect with backoff.
-      const BACKOFF: BackoffPolicy = { initialMs: 2_000, maxMs: 60_000, factor: 2, jitter: 0.2 };
+      const BACKOFF: BackoffPolicy = { initialMs: 1_000, maxMs: 10_000, factor: 2, jitter: 0.2 };
       let attempts = 0;
 
       while (!ctx.abortSignal?.aborted) {
@@ -291,7 +291,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 const finalText = cleanText.trim();
 
                 // Post signal FIRST — dispatch route polls coordination channel
-                // with 45s timeout; sending signal before public message minimizes
+                // with 20s timeout; sending signal before public message minimizes
                 // the window where the poll might time out on slow responses.
                 if (signal && bus && account.decodedToken?.coordChatId) {
                   const signalPayload = JSON.stringify({

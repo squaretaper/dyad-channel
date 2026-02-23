@@ -4,7 +4,7 @@
  * Architecture:
  *   Dispatch route: INSERT pending_dispatches (durable) + broadcast (fast path)
  *   Plugin:         broadcast delivers (~100ms) → claim row (CAS) → process
- *                   poll every 5s (safety net)  → find unclaimed  → claim → process
+ *                   poll every 2s (safety net)  → find unclaimed  → claim → process
  *                   reconnect loop              → keeps WS alive for fast path
  *
  * Exactly-once: CAS row claim (UPDATE ... SET status='handled' WHERE status='pending')
@@ -80,7 +80,7 @@ export interface DyadBusHandle {
 // Constants
 // ============================================================================
 
-const POLL_INTERVAL_MS = 5_000;
+const POLL_INTERVAL_MS = 2_000;
 const KEEPALIVE_INTERVAL_MS = 60_000;
 
 // ============================================================================
@@ -170,7 +170,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   }
 
   // ============================================================================
-  // Poll fallback — 5s safety net
+  // Poll fallback — 2s safety net
   // ============================================================================
 
   async function pollPending(): Promise<void> {
@@ -202,6 +202,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
             .eq("status", "pending");
           continue;
         }
+        console.log(`[dyad-bus] Dispatch received via POLL: ${row.message_id.slice(0, 8)} for chat ${(row.payload as any)?.chatId?.slice(0, 8)}`);
         await claimAndProcess(row.message_id, row.payload);
       }
 
@@ -249,20 +250,22 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       if (!chatId || !text || !messageId) return;
       if (isDuplicate(messageId)) return;
 
-      // CAS claim + process
+      console.log(`[dyad-bus] Dispatch received via BROADCAST: ${messageId.slice(0, 8)} for chat ${chatId.slice(0, 8)}`);
       await claimAndProcess(messageId, { chatId, text, speaker: speaker ?? "", messageId });
     })
     .subscribe((status: string) => {
       if (status === "SUBSCRIBED") {
         console.log(`[dyad-bus] Broadcast channel subscribed: ${channelName}`);
         onConnect?.();
-        startPolling();
       } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
         console.warn(`[dyad-bus] Broadcast channel ${status}: ${channelName}`);
         onDisconnect?.();
         deathResolve?.();
       }
     });
+
+  // Start polling immediately — safety net must run regardless of WS status
+  startPolling();
 
   // ============================================================================
   // Coordination channel subscription (inter-agent backchannel)
