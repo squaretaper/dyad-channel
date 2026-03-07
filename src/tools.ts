@@ -1,11 +1,14 @@
 /**
- * OpenClaw agent tools for inter-agent dialogue via the Dyad coordination channel.
+ * OpenClaw agent tools for inter-agent dialogue via the Dyad coordination channel,
+ * plus dynamically discovered workspace tools (create_file, read_file, etc.).
  *
- * Two tools:
+ * Static tools:
  * - dyad_coord_send: Post a message to another agent via #coordination
  * - dyad_coord_history: Query past coordination messages
  *
- * Both use the Dyad bot/message API route (service-role backed, bypasses RLS).
+ * Dynamic tools (discovered at startup via MCP tools/list):
+ * - All workspace tools registered on the Dyad MCP endpoint
+ * - Proxied via JSON-RPC to POST /api/mcp
  */
 
 import { Type, type Static } from "@sinclair/typebox";
@@ -349,4 +352,140 @@ export function createCoordHistoryTool(): ToolFactory {
       },
     } as AnyAgentTool;
   };
+}
+
+// ============================================================================
+// Dynamic workspace tools (discovered from Dyad MCP endpoint)
+// ============================================================================
+
+/**
+ * Discover workspace tools from the Dyad MCP endpoint and create
+ * OpenClaw tool factories that proxy calls via JSON-RPC.
+ *
+ * Called once at plugin registration. Each discovered tool becomes
+ * an OpenClaw tool that the agent can call like any other tool.
+ */
+export function createWorkspaceToolFactories(): ToolFactory[] {
+  let cachedTools: Array<{ name: string; description: string; inputSchema: any }> | null = null;
+  let discoveryPromise: Promise<void> | null = null;
+
+  async function discoverTools(apiUrl: string, apiToken: string): Promise<void> {
+    if (cachedTools) return;
+    if (discoveryPromise) {
+      await discoveryPromise;
+      return;
+    }
+
+    discoveryPromise = (async () => {
+      try {
+        const res = await fetch(`${apiUrl}/api/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiToken}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "discover",
+            method: "tools/list",
+          }),
+        });
+
+        if (!res.ok) {
+          console.error(`[dyad-tools] Discovery failed: HTTP ${res.status}`);
+          cachedTools = [];
+          return;
+        }
+
+        const body = await res.json();
+        cachedTools = body.result?.tools || [];
+        console.log(`[dyad-tools] Discovered ${cachedTools!.length} workspace tools`);
+      } catch (e: any) {
+        console.error(`[dyad-tools] Discovery error: ${e.message}`);
+        cachedTools = [];
+      }
+    })();
+
+    await discoveryPromise;
+  }
+
+  const factory: ToolFactory = (ctx) => {
+    const coord = readCoordConfig(ctx);
+    if (!coord) return null;
+
+    // Kick off async discovery — tools available after first resolve
+    discoverTools(coord.apiUrl, coord.apiBotToken);
+
+    if (!cachedTools || cachedTools.length === 0) return null;
+
+    const staticNames = new Set(["dyad_coord_send", "dyad_coord_history"]);
+
+    return cachedTools
+      .filter((t) => !staticNames.has(t.name))
+      .map((tool) => {
+        const params = Type.Object(
+          Object.fromEntries(
+            Object.entries(tool.inputSchema?.properties || {}).map(
+              ([key, prop]: [string, any]) => {
+                const required = (tool.inputSchema?.required || []).includes(key);
+                const schema = prop.type === "number"
+                  ? Type.Number({ description: prop.description })
+                  : Type.String({ description: prop.description });
+                return [key, required ? schema : Type.Optional(schema)];
+              },
+            ),
+          ),
+        );
+
+        return {
+          name: `dyad_${tool.name}`,
+          label: tool.name.replace(/_/g, " "),
+          description: tool.description,
+          parameters: params,
+          execute: async (_toolCallId: string, args: Record<string, any>) => {
+            try {
+              const res = await fetch(`${coord.apiUrl}/api/mcp`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${coord.apiBotToken}`,
+                },
+                body: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: _toolCallId || "call",
+                  method: "tools/call",
+                  params: { name: tool.name, arguments: args },
+                }),
+              });
+
+              if (!res.ok) {
+                return {
+                  content: [{ type: "text" as const, text: `Tool call failed: HTTP ${res.status}` }],
+                  details: {},
+                };
+              }
+
+              const body = await res.json();
+              const result = body.result || body.error;
+
+              const text = result?.content
+                ?.map((c: any) => c.text)
+                .join("\n") || JSON.stringify(result);
+
+              return {
+                content: [{ type: "text" as const, text }],
+                details: {},
+              };
+            } catch (e: any) {
+              return {
+                content: [{ type: "text" as const, text: `Tool error: ${e.message}` }],
+                details: {},
+              };
+            }
+          },
+        } as AnyAgentTool;
+      });
+  };
+
+  return [factory];
 }
