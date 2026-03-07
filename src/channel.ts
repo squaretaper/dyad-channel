@@ -4,7 +4,7 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
 import { DyadConfigSchema } from "./config-schema.js";
-import { startDyadBus, type DyadBusHandle } from "./supabase-bus.js";
+import { startDyadBus, type DyadBusHandle, type TransportHealth, CoalesceBuffer } from "./supabase-bus.js";
 import {
   listDyadAccountIds,
   resolveDefaultDyadAccountId,
@@ -63,6 +63,51 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Transport health — shared between startAccount and collectStatusIssues
+const accountHealth = new Map<string, TransportHealth>();
+const PROBE_INTERVAL_MS = 30_000;
+const CHUNK_MAX_SIZE = 10_000;
+
+/**
+ * Markdown-aware text chunker — splits at paragraph/line/sentence boundaries.
+ * Receives CLEAN text (coord blocks already stripped by parseCoordinationSignal).
+ */
+function chunkMarkdownText(text: string, maxSize: number): string[] {
+  if (text.length <= maxSize) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > maxSize) {
+    let splitAt = maxSize;
+
+    // Prefer paragraph boundary (double newline)
+    const paraIdx = remaining.lastIndexOf("\n\n", maxSize);
+    if (paraIdx > maxSize * 0.3) {
+      splitAt = paraIdx + 2;
+    } else {
+      // Prefer single newline
+      const lineIdx = remaining.lastIndexOf("\n", maxSize);
+      if (lineIdx > maxSize * 0.3) {
+        splitAt = lineIdx + 1;
+      } else {
+        // Prefer sentence boundary
+        const sentIdx = remaining.lastIndexOf(". ", maxSize);
+        if (sentIdx > maxSize * 0.3) {
+          splitAt = sentIdx + 2;
+        }
+        // else: hard split at maxSize
+      }
+    }
+
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
 
 export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
   id: "dyad",
@@ -166,18 +211,49 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
     },
     collectStatusIssues: (accounts) =>
       accounts.flatMap((account) => {
+        const issues: Array<{
+          channel: string;
+          accountId: string;
+          kind: "runtime";
+          message: string;
+        }> = [];
+
         const lastError = typeof account.lastError === "string" ? account.lastError.trim() : "";
-        if (!lastError) {
-          return [];
-        }
-        return [
-          {
+        if (lastError) {
+          issues.push({
             channel: "dyad",
             accountId: account.accountId,
             kind: "runtime" as const,
             message: `Channel error: ${lastError}`,
-          },
-        ];
+          });
+        }
+
+        // Transport health: probe failure
+        const health = accountHealth.get(account.accountId);
+        if (health) {
+          if (health.lastProbeAt && !health.lastProbeOk) {
+            issues.push({
+              channel: "dyad",
+              accountId: account.accountId,
+              kind: "runtime" as const,
+              message: `Realtime probe failed: ${health.lastProbeError ?? "unknown"}`,
+            });
+          }
+          // Stale dispatch warning (no dispatch in 5 min while running)
+          if (account.running && health.lastDispatchAt) {
+            const staleMs = Date.now() - health.lastDispatchAt;
+            if (staleMs > 300_000) {
+              issues.push({
+                channel: "dyad",
+                accountId: account.accountId,
+                kind: "runtime" as const,
+                message: `Last dispatch was ${Math.round(staleMs / 60_000)}min ago — possible stale transport`,
+              });
+            }
+          }
+        }
+
+        return issues;
       }),
     buildChannelSummary: ({ snapshot }) => ({
       configured: snapshot.configured ?? false,
@@ -356,8 +432,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                     );
                   }
                 } else if (finalText) {
-                  await bus!.sendMessage(chatId, finalText);
-                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, combined)`);
+                  const chunks = chunkMarkdownText(finalText, CHUNK_MAX_SIZE);
+                  for (const chunk of chunks) {
+                    await bus!.sendMessage(chatId, chunk);
+                  }
+                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, ${chunks.length} chunk(s))`);
                 } else {
                   ctx.log?.warn(`${tag} Empty public text after signal stripping (raw=${accumulatedRaw.length} chars) — no message sent for chat ${chatId}`);
                 }
@@ -450,12 +529,22 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
 
           activeBuses.set(account.accountId, bus);
           markBusReady(account.accountId);
+          accountHealth.set(account.accountId, bus.health);
           ctx.setStatus({ accountId: account.accountId, running: true, lastStartAt: Date.now(), lastError: null });
           attempts = 0;
           ctx.log?.info(`${tag} Connected — broadcast + poll active`);
 
+          // Periodic probe — detect silent WS death before messages are lost
+          const probeTimer = setInterval(async () => {
+            const result = await bus!.probeDyad();
+            if (!result.ok) {
+              ctx.log?.warn(`${tag} Probe failed: ${result.error} (${result.latencyMs}ms)`);
+            }
+          }, PROBE_INTERVAL_MS);
+
           // Block until WS dies (poll keeps running independently)
           await bus.waitUntilDead();
+          clearInterval(probeTimer);
           ctx.log?.warn(`${tag} WS died, reconnecting for fast-path...`);
         } catch (err: any) {
           ctx.log?.error(`${tag} Connection error: ${err.message}`);
@@ -468,6 +557,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
         }
         activeBuses.delete(account.accountId);
         resetBusReady(account.accountId);
+        accountHealth.delete(account.accountId);
         if (ctx.abortSignal?.aborted) break;
 
         attempts++;

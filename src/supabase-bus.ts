@@ -30,6 +30,62 @@ function isDuplicate(messageId: string): boolean {
 }
 
 // ============================================================================
+// Streaming coalesce buffer — prevents micro-POSTs from fast streaming models
+// ============================================================================
+
+export class CoalesceBuffer {
+  private buffer = "";
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private flushing: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly flush: (text: string) => Promise<void>,
+    private readonly minChars = 1500,
+    private readonly idleMs = 1000,
+  ) {}
+
+  append(chunk: string): void {
+    this.buffer += chunk;
+    if (this.timer) clearTimeout(this.timer);
+
+    if (this.buffer.length >= this.minChars) {
+      this.flushing = this.doFlush();
+    } else {
+      this.timer = setTimeout(() => {
+        this.flushing = this.doFlush();
+      }, this.idleMs);
+    }
+  }
+
+  async finalize(): Promise<void> {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    await this.flushing;
+    if (this.buffer.length > 0) {
+      await this.doFlush();
+    }
+  }
+
+  private async doFlush(): Promise<void> {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    const text = this.buffer;
+    this.buffer = "";
+    if (text) await this.flush(text);
+  }
+}
+
+// ============================================================================
+// Transport health tracking
+// ============================================================================
+
+export interface TransportHealth {
+  lastDispatchAt: number | null;
+  lastProbeAt: number | null;
+  lastProbeOk: boolean;
+  lastProbeLatencyMs: number;
+  lastProbeError?: string;
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -71,8 +127,10 @@ export interface DyadBusHandle {
   sendMessage: (chatId: string, content: string) => Promise<void>;
   sendCoordinationMessage: (chatId: string, content: string) => Promise<void>;
   sendAgentResponse: (chatId: string, response: import("./agent-types.js").AgentResponse) => Promise<void>;
+  probeDyad: () => Promise<{ ok: boolean; latencyMs: number; error?: string }>;
   disconnect: () => Promise<void>;
   waitUntilDead: () => Promise<void>;
+  health: TransportHealth;
   client: SupabaseClient;
 }
 
@@ -130,6 +188,14 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   const bootTime = new Date().toISOString();
   console.log(`[dyad-bus] Boot time: ${bootTime}`);
 
+  // Transport health tracking
+  const health: TransportHealth = {
+    lastDispatchAt: null,
+    lastProbeAt: null,
+    lastProbeOk: true,
+    lastProbeLatencyMs: 0,
+  };
+
   // Death signal — resolves when WS dies (reconnect loop in channel.ts restarts)
   let deathResolve: (() => void) | null = null;
   const deathPromise = new Promise<void>((r) => { deathResolve = r; });
@@ -160,6 +226,7 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       onError(err as Error, "cas-claim");
     }
 
+    health.lastDispatchAt = Date.now();
     await onMessage({
       chatId: payload.chatId,
       text: payload.text,
@@ -454,7 +521,37 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       await supabase.removeAllChannels();
     },
 
+    async probeDyad(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+      const start = Date.now();
+      try {
+        const { error } = await supabase
+          .from("bot_tokens")
+          .select("id")
+          .eq("id", botId)
+          .limit(1);
+        const latencyMs = Date.now() - start;
+        health.lastProbeAt = Date.now();
+        if (error) {
+          health.lastProbeOk = false;
+          health.lastProbeError = error.message;
+          return { ok: false, latencyMs, error: error.message };
+        }
+        health.lastProbeOk = true;
+        health.lastProbeError = undefined;
+        health.lastProbeLatencyMs = latencyMs;
+        return { ok: true, latencyMs };
+      } catch (err) {
+        const latencyMs = Date.now() - start;
+        health.lastProbeAt = Date.now();
+        health.lastProbeOk = false;
+        health.lastProbeError = (err as Error).message;
+        return { ok: false, latencyMs, error: (err as Error).message };
+      }
+    },
+
     waitUntilDead: () => deathPromise,
+
+    health,
 
     client: supabase,
   };
