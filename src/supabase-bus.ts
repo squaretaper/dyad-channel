@@ -457,23 +457,42 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   }
 
   // ============================================================================
-  // DB keepalive — prevents idle connection timeout
+  // Heartbeat — keeps DB connection alive + proves bot connectivity to Dyad API
   // ============================================================================
 
-  keepaliveTimer = setInterval(async () => {
-    try {
-      const { error } = await supabase
-        .from("bot_tokens")
-        .select("id")
-        .eq("id", botId)
-        .limit(1);
-      if (error) {
-        onError(new Error(error.message), "keepalive query");
+  const pingApi = async () => {
+    if (opts.apiUrl && opts.apiToken) {
+      try {
+        const res = await fetch(`${opts.apiUrl}/api/v2/bot/ping`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${opts.apiToken}` },
+        });
+        if (!res.ok) {
+          onError(new Error(`Ping failed: HTTP ${res.status}`), "heartbeat");
+        }
+      } catch (e) {
+        onError(e as Error, "heartbeat");
       }
-    } catch (e) {
-      onError(e as Error, "keepalive");
+    } else {
+      // Fallback: DB keepalive if no API credentials
+      try {
+        const { error } = await supabase
+          .from("bot_tokens")
+          .select("id")
+          .eq("id", botId)
+          .limit(1);
+        if (error) {
+          onError(new Error(error.message), "keepalive query");
+        }
+      } catch (e) {
+        onError(e as Error, "keepalive");
+      }
     }
-  }, KEEPALIVE_INTERVAL_MS);
+  };
+
+  // Initial ping on startup
+  pingApi();
+  keepaliveTimer = setInterval(pingApi, KEEPALIVE_INTERVAL_MS);
 
   // ============================================================================
   // Public API
