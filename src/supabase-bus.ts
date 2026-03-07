@@ -97,6 +97,10 @@ export interface DyadBusOptions {
   botEmail?: string;
   botPassword?: string;
   botDisplayName?: string;
+  /** Dyad API URL for HTTP message posting (replaces direct Supabase INSERT) */
+  apiUrl?: string;
+  /** Dyad API bearer token for HTTP message posting */
+  apiToken?: string;
   onMessage: (msg: {
     chatId: string;
     text: string;
@@ -126,7 +130,6 @@ export interface DyadBusOptions {
 export interface DyadBusHandle {
   sendMessage: (chatId: string, content: string) => Promise<void>;
   sendCoordinationMessage: (chatId: string, content: string) => Promise<void>;
-  sendAgentResponse: (chatId: string, response: import("./agent-types.js").AgentResponse) => Promise<void>;
   probeDyad: () => Promise<{ ok: boolean; latencyMs: number; error?: string }>;
   disconnect: () => Promise<void>;
   waitUntilDead: () => Promise<void>;
@@ -214,12 +217,18 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   ): Promise<void> {
     // Atomic claim: UPDATE only if status is still 'pending'
     try {
-      await supabase
+      const { data: claimed } = await supabase
         .from("pending_dispatches")
         .update({ status: "handled", handled_at: new Date().toISOString() })
         .eq("bot_id", botId)
         .eq("message_id", messageId)
-        .eq("status", "pending");
+        .eq("status", "pending")
+        .select("id");
+
+      if (!claimed || claimed.length === 0) {
+        console.log(`[dyad-bus] CAS claim lost (0 rows) for ${messageId.slice(0, 8)} — skipping`);
+        return;
+      }
     } catch (err) {
       // CAS claim failed — log but don't block processing.
       // Row may not exist yet (broadcast arrived before INSERT committed).
@@ -240,16 +249,22 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Poll fallback — 2s safety net
   // ============================================================================
 
-  async function pollPending(): Promise<void> {
+  // One-time cleanup: mark stale rows from before boot as handled
+  async function cleanupPreBootRows(): Promise<void> {
     try {
-      // Bulk-mark stale rows from before this bus booted as handled (don't process them)
       await supabase
         .from("pending_dispatches")
         .update({ status: "handled", handled_at: new Date().toISOString() })
         .eq("bot_id", botId)
         .eq("status", "pending")
         .lt("created_at", bootTime);
+    } catch (err) {
+      onError(err as Error, "pre-boot-cleanup");
+    }
+  }
 
+  async function pollPending(): Promise<void> {
+    try {
       const { data } = await supabase
         .from("pending_dispatches")
         .select("*")
@@ -331,7 +346,8 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
       }
     });
 
-  // Start polling immediately — safety net must run regardless of WS status
+  // Clean up pre-boot stale rows (one-time), then start polling
+  await cleanupPreBootRows();
   startPolling();
 
   // ============================================================================
@@ -397,9 +413,11 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
               return;
             }
 
-            // Filter 8: Respect expects_reply=false — sender indicated no reply wanted
-            if (parsed.expects_reply === false) {
-              console.log(`[dyad-bus] Coordination message skipped: expects_reply=false (depth=${depth})`);
+            // Filter 8: Respect expects_reply — default to false for non-question kinds
+            const implicitExpectsReply = (kind === "question");
+            const expectsReply = parsed.expects_reply ?? implicitExpectsReply;
+            if (!expectsReply) {
+              console.log(`[dyad-bus] Coordination message skipped: expects_reply=${expectsReply} (depth=${depth}, kind=${kind})`);
               return;
             }
 
@@ -461,47 +479,40 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
   // Public API
   // ============================================================================
 
+  // Shared helper: POST to Dyad API (replaces direct Supabase INSERT which is blocked by RLS)
+  async function apiPost(path: string, body: Record<string, unknown>): Promise<void> {
+    if (!opts.apiUrl || !opts.apiToken) {
+      throw new Error("apiUrl/apiToken not configured in bot token — cannot post via API");
+    }
+    const res = await fetch(`${opts.apiUrl}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${opts.apiToken}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`API call failed: HTTP ${res.status} — ${text.slice(0, 200)}`);
+    }
+  }
+
   return {
     async sendMessage(chatId: string, content: string): Promise<void> {
-      const { error } = await supabase.from("messages").insert({
+      await apiPost("/api/v2/bot/message", {
         chat_id: chatId,
-        user_id: botUserId,
-        speaker: botDisplayName || "Bot",
         content,
         message_type: "bot_response",
       });
-
-      if (error) {
-        throw new Error(`Failed to send message: ${error.message}`);
-      }
     },
 
     async sendCoordinationMessage(chatId: string, content: string): Promise<void> {
-      const { error } = await supabase.from("messages").insert({
+      await apiPost("/api/v2/bot/message", {
         chat_id: chatId,
-        user_id: botUserId,
-        speaker: botDisplayName || "Bot",
         content,
         message_type: "bot_coordination",
       });
-
-      if (error) {
-        throw new Error(`Failed to send coordination message: ${error.message}`);
-      }
-    },
-
-    async sendAgentResponse(chatId: string, response: import("./agent-types.js").AgentResponse): Promise<void> {
-      const { error } = await supabase.from("messages").insert({
-        chat_id: chatId,
-        user_id: botUserId,
-        speaker: botDisplayName || "Bot",
-        content: JSON.stringify(response),
-        message_type: "agent_response",
-      });
-
-      if (error) {
-        throw new Error(`Failed to send agent_response: ${error.message}`);
-      }
     },
 
     async disconnect(): Promise<void> {

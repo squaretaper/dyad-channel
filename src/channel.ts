@@ -4,7 +4,7 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
 import { DyadConfigSchema } from "./config-schema.js";
-import { startDyadBus, type DyadBusHandle, type TransportHealth, CoalesceBuffer } from "./supabase-bus.js";
+import { startDyadBus, type DyadBusHandle, type TransportHealth } from "./supabase-bus.js";
 import {
   listDyadAccountIds,
   resolveDefaultDyadAccountId,
@@ -13,7 +13,7 @@ import {
 } from "./types.js";
 import { getDyadRuntime } from "./runtime.js";
 import { parseCoordinationSignal } from "./signal-parser.js";
-import { buildAgentResponse } from "./agent-types.js";
+
 
 // Store active bus handles per account
 const activeBuses = new Map<string, DyadBusHandle>();
@@ -316,6 +316,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             botEmail: account.botEmail,
             botPassword: account.botPassword,
             botDisplayName: account.botName,
+            apiUrl: account.decodedToken?.apiUrl,
+            apiToken: account.decodedToken?.apiToken,
             maxCoordinationDepth: account.config.maxCoordinationDepth,
             onMessage: async ({ chatId, text, userId, messageId, speaker }) => {
               ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
@@ -394,21 +396,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
                 }
 
-                // ---- New path: post AgentResponse envelope (dual-format) ----
-                const agentResponse = buildAgentResponse(
-                  finalText,
-                  signal,
-                  account.botName,
-                  chatId,
-                );
-                if (bus) {
-                  await bus.sendAgentResponse(chatId, agentResponse).catch((err: any) =>
-                    ctx.log?.warn(`${tag} Failed to post agent_response: ${err.message}`),
-                  );
-                  ctx.log?.info(`${tag} [agent_response] posted for chat ${chatId} (${agentResponse.messages.length} messages)`);
-                }
+                // agent_response is now created server-side by bot/process route
+                // after receiving the bot_response via sendMessage below.
 
-                // Send one combined public message (old path — kept for backward compat)
+                // Send one combined public message
                 const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
                   finalText.startsWith("[NOTHING_FROM_ME]");
 
