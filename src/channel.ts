@@ -12,7 +12,7 @@ import {
   type ResolvedDyadAccount,
 } from "./types.js";
 import { getDyadRuntime } from "./runtime.js";
-import { parseCoordinationSignal } from "./signal-parser.js";
+// Signal parsing moved to app-side bot/process — plugin is transport only
 
 
 // Store active bus handles per account
@@ -71,7 +71,7 @@ const CHUNK_MAX_SIZE = 10_000;
 
 /**
  * Markdown-aware text chunker — splits at paragraph/line/sentence boundaries.
- * Receives CLEAN text (coord blocks already stripped by parseCoordinationSignal).
+ * Receives raw text (signal parsing happens server-side in bot/process).
  */
 function chunkMarkdownText(text: string, maxSize: number): string[] {
   if (text.length <= maxSize) return [text];
@@ -363,73 +363,17 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
                 }
 
-                // ---- Post-dispatch: parse full text once ----
+                // ---- Post raw text to bot/message — all intelligence is server-side ----
+                // Plugin is transport only. Signal parsing, stripping, coord channel
+                // posting, and chain continuation all happen in bot/process.
                 ctx.log?.info(`${tag} Accumulated ${accumulatedRaw.length} raw chars for chat ${chatId}`);
-                const { signal, cleanText } = parseCoordinationSignal(accumulatedRaw);
-                const finalText = cleanText.trim();
+                const rawText = accumulatedRaw.trim();
 
-                // Post signal FIRST — dispatch route polls coordination channel
-                // with 20s timeout; sending signal before public message minimizes
-                // the window where the poll might time out on slow responses.
-                if (signal && bus && account.decodedToken?.coordChatId) {
-                  const signalPayload = JSON.stringify({
-                    protocol: "dyad-coord-v2",
-                    kind: "signal",
-                    agent: account.botName,
-                    solo_insufficient: signal.solo_insufficient,
-                    confidence: signal.confidence,
-                    reason: signal.reason,
-                    suggested_angle: signal.suggested_angle,
-                    basis: signal.basis,
-                    chain_depth: signal.chain_depth,
-                    source_chat_id: chatId,
-                    display: signal.display || `${account.botName}: solo_insufficient=${signal.solo_insufficient} (${signal.confidence})`,
-                  });
-                  await bus.sendCoordinationMessage(
-                    account.decodedToken.coordChatId,
-                    signalPayload,
-                  ).catch((err: any) =>
-                    ctx.log?.warn(`${tag} Failed to post signal: ${err.message}`),
-                  );
-                  ctx.log?.info(`${tag} [coord] Signal posted: solo_insufficient=${signal.solo_insufficient}, confidence=${signal.confidence}`);
-                } else if (!signal) {
-                  ctx.log?.warn(`${tag} [coord] No coordination signal in response (emission error)`);
-                }
-
-                // agent_response is now created server-side by bot/process route
-                // after receiving the bot_response via sendMessage below.
-
-                // Send one combined public message
-                const isNothingFromMe = finalText === "[NOTHING_FROM_ME]" ||
-                  finalText.startsWith("[NOTHING_FROM_ME]");
-
-                if (isNothingFromMe) {
-                  ctx.log?.info(`${tag} [NOTHING_FROM_ME] — suppressing response for chat ${chatId}`);
-                  // Post coordination trace so demotion+defer is distinguishable from never-dispatched
-                  if (bus && account.decodedToken?.coordChatId) {
-                    const deferPayload = JSON.stringify({
-                      protocol: "dyad-coord-v2",
-                      kind: "soft_dispatch_defer",
-                      agent: account.botName,
-                      source_chat_id: chatId,
-                      reason: "Agent dispatched (soft) but had nothing differentiated to add.",
-                      display: `${account.botName}: [NOTHING_FROM_ME] — soft dispatch deferred`,
-                    });
-                    await bus.sendCoordinationMessage(
-                      account.decodedToken.coordChatId,
-                      deferPayload,
-                    ).catch((err: any) =>
-                      ctx.log?.warn(`${tag} Failed to post soft_dispatch_defer: ${err.message}`),
-                    );
-                  }
-                } else if (finalText) {
-                  const chunks = chunkMarkdownText(finalText, CHUNK_MAX_SIZE);
-                  for (const chunk of chunks) {
-                    await bus!.sendMessage(chatId, chunk);
-                  }
-                  ctx.log?.info(`${tag} Reply sent to chat ${chatId} (${finalText.length} chars, ${chunks.length} chunk(s))`);
+                if (rawText) {
+                  await bus!.sendMessage(chatId, rawText);
+                  ctx.log?.info(`${tag} Raw reply sent to chat ${chatId} (${rawText.length} chars)`);
                 } else {
-                  ctx.log?.warn(`${tag} Empty public text after signal stripping (raw=${accumulatedRaw.length} chars) — no message sent for chat ${chatId}`);
+                  ctx.log?.warn(`${tag} Empty response — no message sent for chat ${chatId}`);
                 }
               } catch (err: any) {
                 ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
@@ -444,78 +388,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             onDisconnect: () => {
               ctx.log?.warn(`${tag} Disconnected from Supabase Realtime`);
             },
-            // Inter-agent backchannel — subscribe to #coordination chat
-            coordChatId: account.decodedToken?.coordChatId,
-            onCoordinationMessage: async ({ chatId, text, messageId, speaker, kind, depth, rawParsed }) => {
-              ctx.log?.info(`${tag} Coordination from ${speaker}: ${kind} (depth=${depth})`);
-
-              // Skip signal messages — they're informational, not actionable (Phase 1 shadow mode)
-              if (kind === "signal") return;
-
-              try {
-                const rt = getDyadRuntime();
-
-                // Use the source chat's session so the agent has full user conversation context.
-                // Falls back to coordination chat ID for broadcast messages without a source.
-                const sourceChatId = (rawParsed as any).source_chat_id || chatId;
-
-                const msgCtx = {
-                  Body: text,
-                  RawBody: text,
-                  From: speaker,
-                  To: sourceChatId,
-                  SessionKey: `dyad:${sourceChatId}`,
-                  AccountId: account.accountId,
-                  ChatType: "group",
-                  Provider: "dyad",
-                  Surface: "dyad",
-                  OriginatingTo: sourceChatId,
-                  SenderId: speaker,
-                  CommandAuthorized: false,
-                };
-
-                // Accumulate coordination reply chunks, send one combined message
-                let coordAccumulated = "";
-
-                const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-                  ctx: msgCtx,
-                  cfg: ctx.cfg,
-                  dispatcherOptions: {
-                    deliver: async (payload: any, { kind: deliverKind }: any) => {
-                      if (payload.text) coordAccumulated += payload.text;
-                    },
-                    onError: (err: any, { kind: errKind }: any) => {
-                      ctx.log?.error(`${tag} Coordination dispatch error (${errKind}): ${err}`);
-                    },
-                    onSkip: (_payload: any, { kind: skipKind, reason }: any) => {
-                      ctx.log?.warn(`${tag} Coordination reply skipped (${skipKind}): reason=${reason}`);
-                    },
-                  },
-                });
-
-                if (!result.queuedFinal) {
-                  ctx.log?.warn(`${tag} No coordination reply generated for ${speaker}`);
-                }
-
-                // ---- Post-dispatch: send one combined coordination reply ----
-                const coordText = coordAccumulated.trim();
-                if (coordText) {
-                  const replyPayload = JSON.stringify({
-                    protocol: "dyad-coord-v2",
-                    kind: (rawParsed as any).kind === "question" ? "inform" : "status",
-                    to: speaker,
-                    content: coordText,
-                    expects_reply: depth + 1 < (account.config.maxCoordinationDepth ?? 4) - 1,
-                    depth: depth + 1,
-                    source_chat_id: (rawParsed as any).source_chat_id || null,
-                  });
-                  await bus!.sendCoordinationMessage(chatId, replyPayload);
-                  ctx.log?.info(`${tag} Coordination reply sent to ${speaker} (depth=${depth + 1}, ${coordText.length} chars, combined)`);
-                }
-              } catch (err: any) {
-                ctx.log?.error(`${tag} Failed to process coordination message: ${err.message}`);
-              }
-            },
+            // Coordination channel subscription removed — all coordination logic
+            // is server-side in bot/process. Plugin is transport only.
           });
 
           activeBuses.set(account.accountId, bus);
