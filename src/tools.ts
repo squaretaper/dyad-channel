@@ -1,67 +1,17 @@
 /**
- * OpenClaw agent tools for inter-agent dialogue via the Dyad coordination channel,
- * plus dynamically discovered workspace tools (create_file, read_file, etc.).
+ * OpenClaw agent tools for Dyad workspace integration.
  *
- * Static tools:
- * - dyad_coord_send: Post a message to another agent via #coordination
- * - dyad_coord_history: Query past coordination messages
- *
- * Dynamic tools (discovered at startup via MCP tools/list):
- * - All workspace tools registered on the Dyad MCP endpoint
- * - Proxied via JSON-RPC to POST /api/mcp
+ * All tools are dynamically discovered from the Dyad MCP endpoint at startup.
+ * The plugin is a thin transport layer — no business logic, no hardcoded tools.
+ * Tools are proxied via JSON-RPC to POST /api/mcp.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
+import { Type } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import { decodeBotToken } from "./token.js";
 
 // ToolFactory isn't re-exported from plugin-sdk entry
 type ToolFactory = (ctx: { config?: any }) => AnyAgentTool | AnyAgentTool[] | null | undefined;
-
-const COORDINATION_PROTOCOL_VERSION = "dyad-coord-v2";
-
-// ============================================================================
-// Schemas
-// ============================================================================
-
-const CoordSendSchema = Type.Object({
-  to: Type.String({ description: "Name of the agent to message (e.g. 'Ren', 'Noa')" }),
-  message: Type.String({ description: "The message content" }),
-  kind: Type.Optional(
-    Type.Union(
-      [Type.Literal("question"), Type.Literal("inform"), Type.Literal("flag")],
-      {
-        default: "inform",
-        description:
-          "Message type: question (expects reply), inform (FYI), flag (urgent)",
-      },
-    ),
-  ),
-  source_chat_id: Type.Optional(
-    Type.String({
-      description: "Chat ID this message originates from (for scoping coordination to a specific chat)",
-    }),
-  ),
-});
-
-const CoordHistorySchema = Type.Object({
-  limit: Type.Optional(
-    Type.Number({
-      default: 20,
-      description: "Max messages to return (default 20)",
-    }),
-  ),
-  since: Type.Optional(
-    Type.String({
-      description: "ISO timestamp — only return messages after this time",
-    }),
-  ),
-  source_chat_id: Type.Optional(
-    Type.String({
-      description: "Filter to only messages from this chat ID",
-    }),
-  ),
-});
 
 // ============================================================================
 // Config helpers
@@ -78,8 +28,6 @@ function readCoordConfig(ctx: { config?: any }): {
 
   try {
     const decoded = decodeBotToken(rawToken);
-    // Fall back to flat config fields if the token was generated before
-    // coordChatId/apiUrl/apiToken were added to the token payload.
     const coordChatId = decoded.coordChatId ?? dyadCfg?.coordChatId ?? "";
     const apiUrl = decoded.apiUrl ?? dyadCfg?.apiUrl ?? "";
     const apiBotToken = decoded.apiToken ?? dyadCfg?.botToken ?? "";
@@ -91,279 +39,16 @@ function readCoordConfig(ctx: { config?: any }): {
 }
 
 // ============================================================================
-// Tool factories
-// ============================================================================
-
-/**
- * Factory for the dyad_coord_send tool.
- * Reads Dyad coordination config from raw plugin config at tool-call time.
- */
-export function createCoordSendTool(): ToolFactory {
-  return (ctx) => {
-    const coord = readCoordConfig(ctx);
-    if (!coord) return null;
-
-    return {
-      name: "dyad_coord_send",
-      label: "Send to Agent",
-      description:
-        "Send a message to another agent in the Dyad workspace via the coordination channel. " +
-        "Use this to ask questions, share information, or flag issues to other agents. " +
-        "The other agent will receive your message and can reply.",
-      parameters: CoordSendSchema,
-      execute: async (
-        _toolCallId: string,
-        params: Static<typeof CoordSendSchema>,
-      ) => {
-        const kind = params.kind || "inform";
-        const expectsReply = kind === "question";
-
-        const payload = JSON.stringify({
-          protocol: COORDINATION_PROTOCOL_VERSION,
-          kind,
-          to: params.to,
-          content: params.message,
-          expects_reply: expectsReply,
-          depth: 0,
-          source_chat_id: params.source_chat_id || null,
-        });
-
-        try {
-          const res = await fetch(`${coord.apiUrl}/api/v2/bot/message`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${coord.apiBotToken}`,
-            },
-            body: JSON.stringify({
-              chat_id: coord.coordChatId,
-              content: payload,
-              message_type: "bot_coordination",
-            }),
-          });
-
-          if (!res.ok) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `✗ coord send failed: HTTP ${res.status}`,
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const body = await res.json().catch(() => null);
-          const id = body?.id || body?.message?.id || "";
-          const idSuffix = id ? ` | id:${id.slice(0, 4)}…${id.slice(-4)}` : "";
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `✓ coord → ${params.to}${idSuffix}`,
-              },
-            ],
-            details: {},
-          };
-        } catch (e: any) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `✗ coord send failed: ${e.message.slice(0, 80)}`,
-              },
-            ],
-            details: {},
-          };
-        }
-      },
-    } as AnyAgentTool;
-  };
-}
-
-/**
- * Factory for the dyad_coord_history tool.
- * Queries coordination channel messages via the bot/message GET endpoint.
- */
-export function createCoordHistoryTool(): ToolFactory {
-  return (ctx) => {
-    const coord = readCoordConfig(ctx);
-    if (!coord) return null;
-
-    return {
-      name: "dyad_coord_history",
-      label: "Coordination History",
-      description:
-        "Query the coordination channel history to see past messages exchanged between agents. " +
-        "Returns coordination rounds, proposals, intents, and inter-agent dialogue. " +
-        "Use this to recall what was discussed or decided in previous rounds.",
-      parameters: CoordHistorySchema,
-      execute: async (
-        _toolCallId: string,
-        params: Static<typeof CoordHistorySchema>,
-      ) => {
-        const limit = params.limit || 20;
-
-        try {
-          const url = new URL(`${coord.apiUrl}/api/v2/bot/message`);
-          url.searchParams.set("chat_id", coord.coordChatId);
-          url.searchParams.set("limit", String(limit));
-          url.searchParams.set("message_type", "bot_coordination,agent_response");
-          if (params.since) {
-            url.searchParams.set("since", params.since);
-          }
-
-          const res = await fetch(url.toString(), {
-            headers: {
-              Authorization: `Bearer ${coord.apiBotToken}`,
-            },
-          });
-
-          if (!res.ok) {
-            const text = await res.text().catch(() => "");
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Failed to fetch history: HTTP ${res.status} — ${text.slice(0, 200)}`,
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const data = await res.json();
-          const messages: any[] = data.messages || [];
-
-          let recent = messages; // API handles limit + type filtering
-
-          if (params.source_chat_id) {
-            recent = recent.filter((msg: any) => {
-              try {
-                const parsed = JSON.parse(msg.content);
-                return parsed.source_chat_id === params.source_chat_id;
-              } catch {
-                return false;
-              }
-            });
-          }
-
-          if (recent.length === 0) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: "No coordination messages found.",
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const lines = recent.map((msg: any) => {
-            const ts = msg.created_at
-              ? new Date(msg.created_at).toLocaleString("en-US", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  hour12: false,
-                })
-              : "";
-
-            let summary: string;
-            try {
-              const parsed = JSON.parse(msg.content);
-
-              // Handle agent_response envelope (v8 structured format)
-              if (msg.message_type === "agent_response" && parsed.content !== undefined && parsed.messages) {
-                const sigMsg = (parsed.messages as any[]).find((m: any) => m.kind === "signal");
-                if (sigMsg) {
-                  const si = sigMsg.payload?.solo_insufficient ? "TRUE" : "false";
-                  summary = `[agent_response] signal: solo_insufficient=${si}, confidence=${sigMsg.confidence ?? "n/a"}, content=${(parsed.content || "").slice(0, 150)}…`;
-                } else {
-                  summary = `[agent_response] content=${(parsed.content || "").slice(0, 200)}…`;
-                }
-                return `${msg.speaker} (${ts}): ${summary}`;
-              }
-
-              if (parsed.intent?.type === "round_start") {
-                summary = `[round_start] trigger: "${(parsed.trigger_content || "").slice(0, 150)}"`;
-              } else if (parsed.kind === "propose") {
-                summary = `[propose] angle: "${parsed.proposal?.angle || ""}", covers: [${(parsed.proposal?.covers || []).join(", ")}]`;
-              } else if (parsed.kind === "accept") {
-                summary = `[accept]`;
-              } else if (parsed.kind === "counter") {
-                summary = `[counter] angle: "${parsed.proposal?.angle || ""}"`;
-              } else if (parsed.kind === "ready") {
-                summary = `[ready] intent: ${parsed.intent?.type || "unknown"}, summary: "${(parsed.summary || "").slice(0, 150)}"`;
-              } else if (parsed.kind === "micro_propose") {
-                summary = `[micro_propose] angle: "${parsed.proposal?.angle || ""}", confidence: ${parsed.proposal?.confidence ?? "n/a"}`;
-              } else if (parsed.kind === "resolved") {
-                const runnerUpLabel = parsed.runner_up ? `, runner_up: ${parsed.runner_up}` : "";
-                summary = `[resolved] mode: ${parsed.mode || "n/a"}, winner: ${parsed.winner || "n/a"}${runnerUpLabel}, reason: "${(parsed.reason || "").slice(0, 150)}"`;
-              } else if (parsed.kind === "response_summary") {
-                summary = `[response_summary] "${(parsed.content || "").slice(0, 250)}"`;
-              } else if (
-                ["question", "inform", "flag", "delegate", "status"].includes(
-                  parsed.kind,
-                )
-              ) {
-                const toLabel = parsed.to ? ` → ${parsed.to}` : "";
-                summary = `[${parsed.kind}${toLabel}] ${(parsed.content || "").slice(0, 250)}`;
-              } else if (parsed.kind === "signal") {
-                const si = parsed.solo_insufficient ? "TRUE" : "false";
-                summary = `[signal] solo_insufficient: ${si}, confidence: ${parsed.confidence ?? "n/a"}, reason: "${(parsed.reason || "").slice(0, 300)}"`;
-              } else if (parsed.kind === "judgment_trace") {
-                summary = `[chain_trace] depth=${parsed.chain_depth ?? "?"}, ended: ${parsed.termination_reason || "unknown"}, ${parsed.display || ""}`;
-              } else if (parsed.kind === "routing_decision") {
-                summary = `[routing] route=${parsed.route}, source=${parsed.source}, confidence=${parsed.confidence}`;
-              } else if (parsed.kind === "soft_dispatch_defer") {
-                summary = `[soft_dispatch_defer] ${parsed.agent || "unknown"}: dispatched but deferred — nothing differentiated to add`;
-              } else {
-                summary = msg.content.slice(0, 250);
-              }
-            } catch {
-              summary = msg.content.slice(0, 250);
-            }
-
-            return `${msg.speaker} (${ts}): ${summary}`;
-          });
-
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `coord history (${recent.length}):\n${lines.join("\n")}`,
-              },
-            ],
-            details: {},
-          };
-        } catch (e: any) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Failed to fetch history: ${e.message}`,
-              },
-            ],
-            details: {},
-          };
-        }
-      },
-    } as AnyAgentTool;
-  };
-}
-
-// ============================================================================
 // Dynamic workspace tools (discovered from Dyad MCP endpoint)
 // ============================================================================
 
 /**
- * Discover workspace tools from the Dyad MCP endpoint and create
+ * Discover ALL workspace tools from the Dyad MCP endpoint and create
  * OpenClaw tool factories that proxy calls via JSON-RPC.
  *
- * Called once at plugin registration. Each discovered tool becomes
- * an OpenClaw tool that the agent can call like any other tool.
+ * This includes coordination tools (send_coordination_message,
+ * get_coordination_context) which are MCP tools like any other.
+ * The plugin has no hardcoded business logic — everything goes through MCP.
  */
 export function createWorkspaceToolFactories(): ToolFactory[] {
   let cachedTools: Array<{ name: string; description: string; inputSchema: any }> | null = null;
@@ -418,73 +103,69 @@ export function createWorkspaceToolFactories(): ToolFactory[] {
 
     if (!cachedTools || cachedTools.length === 0) return null;
 
-    const staticNames = new Set(["dyad_coord_send", "dyad_coord_history"]);
-
-    return cachedTools
-      .filter((t) => !staticNames.has(t.name))
-      .map((tool) => {
-        const params = Type.Object(
-          Object.fromEntries(
-            Object.entries(tool.inputSchema?.properties || {}).map(
-              ([key, prop]: [string, any]) => {
-                const required = (tool.inputSchema?.required || []).includes(key);
-                const schema = prop.type === "number"
-                  ? Type.Number({ description: prop.description })
-                  : Type.String({ description: prop.description });
-                return [key, required ? schema : Type.Optional(schema)];
-              },
-            ),
+    return cachedTools.map((tool) => {
+      const params = Type.Object(
+        Object.fromEntries(
+          Object.entries(tool.inputSchema?.properties || {}).map(
+            ([key, prop]: [string, any]) => {
+              const required = (tool.inputSchema?.required || []).includes(key);
+              const schema = prop.type === "number"
+                ? Type.Number({ description: prop.description })
+                : Type.String({ description: prop.description });
+              return [key, required ? schema : Type.Optional(schema)];
+            },
           ),
-        );
+        ),
+      );
 
-        return {
-          name: `dyad_${tool.name}`,
-          label: tool.name.replace(/_/g, " "),
-          description: tool.description,
-          parameters: params,
-          execute: async (_toolCallId: string, args: Record<string, any>) => {
-            try {
-              const res = await fetch(`${coord.apiUrl}/api/mcp`, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  Authorization: `Bearer ${coord.apiBotToken}`,
-                },
-                body: JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: _toolCallId || "call",
-                  method: "tools/call",
-                  params: { name: tool.name, arguments: args },
-                }),
-              });
+      return {
+        name: `dyad_${tool.name}`,
+        label: tool.name.replace(/_/g, " "),
+        description: tool.description,
+        parameters: params,
+        execute: async (_toolCallId: string, args: Record<string, any>) => {
+          try {
+            const res = await fetch(`${coord.apiUrl}/api/mcp`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${coord.apiBotToken}`,
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: _toolCallId || "call",
+                method: "tools/call",
+                params: { name: tool.name, arguments: args },
+              }),
+            });
 
-              if (!res.ok) {
-                return {
-                  content: [{ type: "text" as const, text: `Tool call failed: HTTP ${res.status}` }],
-                  details: {},
-                };
-              }
-
-              const body = await res.json();
-              const result = body.result || body.error;
-
-              const text = result?.content
-                ?.map((c: any) => c.text)
-                .join("\n") || JSON.stringify(result);
-
+            if (!res.ok) {
               return {
-                content: [{ type: "text" as const, text }],
-                details: {},
-              };
-            } catch (e: any) {
-              return {
-                content: [{ type: "text" as const, text: `Tool error: ${e.message}` }],
+                content: [{ type: "text" as const, text: `Tool call failed: HTTP ${res.status}` }],
                 details: {},
               };
             }
-          },
-        } as AnyAgentTool;
-      });
+
+            const body = await res.json();
+            const result = body.result || body.error;
+
+            const text = result?.content
+              ?.map((c: any) => c.text)
+              .join("\n") || JSON.stringify(result);
+
+            return {
+              content: [{ type: "text" as const, text }],
+              details: {},
+            };
+          } catch (e: any) {
+            return {
+              content: [{ type: "text" as const, text: `Tool error: ${e.message}` }],
+              details: {},
+            };
+          }
+        },
+      } as AnyAgentTool;
+    });
   };
 
   return [factory];

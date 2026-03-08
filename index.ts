@@ -2,7 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { dyadPlugin } from "./src/channel.js";
 import { setDyadRuntime } from "./src/runtime.js";
-import { createCoordSendTool, createCoordHistoryTool } from "./src/tools.js";
+import { createWorkspaceToolFactories } from "./src/tools.js";
 
 // OpenClawPluginDefinition — typed inline to avoid import path issues with symlinked modules
 const plugin: {
@@ -19,9 +19,11 @@ const plugin: {
   register(api: OpenClawPluginApi) {
     setDyadRuntime(api.runtime);
     api.registerChannel({ plugin: dyadPlugin });
-    // Register inter-agent coordination tools
-    api.registerTool(createCoordSendTool());
-    api.registerTool(createCoordHistoryTool());
+    // Register ALL workspace tools (dynamically discovered from Dyad MCP endpoint).
+    // No hardcoded business logic — plugin is transport only.
+    for (const factory of createWorkspaceToolFactories()) {
+      api.registerTool(factory);
+    }
   },
 };
 
