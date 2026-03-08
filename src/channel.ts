@@ -368,6 +368,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 // posting, and chain continuation all happen in bot/process.
                 ctx.log?.info(`${tag} Accumulated ${accumulatedRaw.length} raw chars for chat ${chatId}`);
                 const rawText = accumulatedRaw.trim();
+                const hasCoordBlock = rawText.includes('[COORDINATION]');
+                ctx.log?.info(`${tag} [DEBUG] hasCoordBlock=${hasCoordBlock} first200chars=${JSON.stringify(rawText.slice(0, 200))}`);
 
                 if (rawText) {
                   await bus!.sendMessage(chatId, rawText);
