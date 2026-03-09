@@ -129,6 +129,7 @@ export interface DyadBusOptions {
 
 export interface DyadBusHandle {
   sendMessage: (chatId: string, content: string) => Promise<void>;
+  sendStreamingChunk: (chatId: string, content: string, exchangeId: string, sequenceNumber: number, isFinal: boolean) => Promise<void>;
   sendCoordinationMessage: (chatId: string, content: string) => Promise<void>;
   probeDyad: () => Promise<{ ok: boolean; latencyMs: number; error?: string }>;
   disconnect: () => Promise<void>;
@@ -523,6 +524,17 @@ export async function startDyadBus(opts: DyadBusOptions): Promise<DyadBusHandle>
         chat_id: chatId,
         content,
         message_type: "bot_response",
+      });
+    },
+
+    async sendStreamingChunk(chatId: string, content: string, exchangeId: string, sequenceNumber: number, isFinal: boolean): Promise<void> {
+      await apiPost("/api/v2/bot/message", {
+        chat_id: chatId,
+        content,
+        message_type: "bot_response",
+        is_final: isFinal,
+        exchange_id: exchangeId,
+        sequence_number: sequenceNumber,
       });
     },
 

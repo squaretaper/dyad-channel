@@ -340,15 +340,42 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   CommandAuthorized: false,
                 };
 
-                // Accumulate all chunks, parse + send once after dispatch completes
-                let accumulatedRaw = "";
+                // Streaming: POST cumulative chunks as they arrive from OpenClaw
+                const exchangeId = crypto.randomUUID();
+                let accumulated = "";
+                let buffer = "";
+                let sequence = 0;
+                let lastPostTime = Date.now();
+
+                const postChunk = async (content: string, isFinal: boolean) => {
+                  sequence++;
+                  await bus!.sendStreamingChunk(chatId, content, exchangeId, sequence, isFinal);
+                };
 
                 const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
                   ctx: msgCtx,
                   cfg: ctx.cfg,
                   dispatcherOptions: {
                     deliver: async (payload: any, { kind }: any) => {
-                      if (payload.text) accumulatedRaw += payload.text;
+                      if (!payload.text) return;
+                      accumulated += payload.text;
+                      buffer += payload.text;
+
+                      // POST at paragraph breaks (100+ chars), 500+ chars, or 5s since last POST
+                      const shouldPost =
+                        buffer.length >= 500 ||
+                        (buffer.length >= 100 && buffer.includes("\n\n")) ||
+                        (buffer.length > 0 && Date.now() - lastPostTime >= 5000);
+
+                      if (shouldPost) {
+                        try {
+                          await postChunk(accumulated, false);
+                          buffer = "";
+                          lastPostTime = Date.now();
+                        } catch (err: any) {
+                          ctx.log?.error(`${tag} Streaming chunk POST failed: ${err.message}`);
+                        }
+                      }
                     },
                     onError: (err: any, { kind }: any) => {
                       ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
@@ -363,17 +390,11 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
                 }
 
-                // ---- Post raw text to bot/message — all intelligence is server-side ----
-                // Plugin is transport only. Signal parsing, stripping, coord channel
-                // posting, and chain continuation all happen in bot/process.
-                ctx.log?.info(`${tag} Accumulated ${accumulatedRaw.length} raw chars for chat ${chatId}`);
-                const rawText = accumulatedRaw.trim();
-                const hasCoordBlock = rawText.includes('[COORDINATION]');
-                ctx.log?.info(`${tag} [DEBUG] hasCoordBlock=${hasCoordBlock} first200chars=${JSON.stringify(rawText.slice(0, 200))}`);
-
+                // Final POST with complete content — triggers bot/process
+                const rawText = accumulated.trim();
                 if (rawText) {
-                  await bus!.sendMessage(chatId, rawText);
-                  ctx.log?.info(`${tag} Raw reply sent to chat ${chatId} (${rawText.length} chars)`);
+                  await postChunk(rawText, true);
+                  ctx.log?.info(`${tag} Streaming complete for chat ${chatId} (${rawText.length} chars, ${sequence} chunks)`);
                 } else {
                   ctx.log?.warn(`${tag} Empty response — no message sent for chat ${chatId}`);
                 }
