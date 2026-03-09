@@ -340,7 +340,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   CommandAuthorized: false,
                 };
 
-                // Streaming: POST cumulative chunks as they arrive from OpenClaw
+                // Streaming: POST cumulative chunks during generation via onPartialReply (Tier 2),
+                // finalize via deliver (Tier 1). Same model as Telegram streaming.
                 const exchangeId = crypto.randomUUID();
                 let accumulated = "";
                 let buffer = "";
@@ -356,7 +357,24 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   ctx: msgCtx,
                   cfg: ctx.cfg,
                   dispatcherOptions: {
-                    deliver: async (payload: any, { kind }: any) => {
+                    deliver: async (payload: any, _meta: any) => {
+                      // Tier 1: fires after generation completes with final block content.
+                      // If onPartialReply was active, it already accumulated all text —
+                      // deliver would duplicate it. Only accumulate if no partials arrived.
+                      if (payload.text && sequence === 0) {
+                        accumulated += payload.text;
+                      }
+                    },
+                    onError: (err: any, { kind }: any) => {
+                      ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
+                    },
+                    onSkip: (payload: any, { kind, reason }: any) => {
+                      ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}`);
+                    },
+                  },
+                  replyOptions: {
+                    onPartialReply: async (payload: any) => {
+                      // Tier 2: fires during token generation with incremental text.
                       if (!payload.text) return;
                       accumulated += payload.text;
                       buffer += payload.text;
@@ -376,12 +394,6 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                           ctx.log?.error(`${tag} Streaming chunk POST failed: ${err.message}`);
                         }
                       }
-                    },
-                    onError: (err: any, { kind }: any) => {
-                      ctx.log?.error(`${tag} Dispatch error (${kind}): ${err}`);
-                    },
-                    onSkip: (payload: any, { kind, reason }: any) => {
-                      ctx.log?.warn(`${tag} Reply skipped (${kind}): reason=${reason}`);
                     },
                   },
                 });
