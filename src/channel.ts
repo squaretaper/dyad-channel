@@ -322,6 +322,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
             onMessage: async ({ chatId, text, userId, messageId, speaker }) => {
               ctx.log?.info(`${tag} Dispatch for chat ${chatId}: ${text.slice(0, 50)}...`);
 
+              let accumulated = "";  // Hoisted for rescue in catch block
               try {
                 const rt = getDyadRuntime();
 
@@ -343,7 +344,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 // Streaming: POST cumulative chunks during generation via onPartialReply (Tier 2),
                 // finalize via deliver (Tier 1). Same model as Telegram streaming.
                 const exchangeId = crypto.randomUUID();
-                let accumulated = "";     // Full response text across all blocks
+                accumulated = "";         // Reset for this exchange
                 let blockPartial = "";    // Current block's cumulative text from onPartialReply
                 let buffer = "";
                 let sequence = 0;
@@ -437,13 +438,31 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 // Final POST with complete content — triggers bot/process
                 const rawText = accumulated.trim();
                 if (rawText) {
-                  await postChunk(rawText, true);
-                  ctx.log?.info(`${tag} Streaming complete for chat ${chatId} (${rawText.length} chars, ${sequence} chunks)`);
+                  try {
+                    await postChunk(rawText, true);
+                    ctx.log?.info(`${tag} Streaming complete for chat ${chatId} (${rawText.length} chars, ${sequence} chunks)`);
+                  } catch (finalErr: any) {
+                    // Streaming final failed — fall back to single-message POST
+                    ctx.log?.warn(`${tag} Streaming final POST failed, falling back to sendMessage: ${finalErr.message}`);
+                    await bus!.sendMessage(chatId, rawText);
+                    ctx.log?.info(`${tag} Fallback sendMessage succeeded for chat ${chatId} (${rawText.length} chars)`);
+                  }
                 } else {
                   ctx.log?.warn(`${tag} Empty response — no message sent for chat ${chatId}`);
                 }
               } catch (err: any) {
                 ctx.log?.error(`${tag} Failed to process message: ${err.message}`);
+                // If we accumulated text before the error, try to deliver it
+                // via the non-streaming path so the user gets something
+                const rescue = accumulated.trim();
+                if (rescue && bus) {
+                  try {
+                    await bus.sendMessage(chatId, rescue);
+                    ctx.log?.info(`${tag} Rescue sendMessage delivered ${rescue.length} chars for chat ${chatId}`);
+                  } catch (rescueErr: any) {
+                    ctx.log?.error(`${tag} Rescue sendMessage also failed: ${rescueErr.message}`);
+                  }
+                }
               }
             },
             onError: (error, context) => {
