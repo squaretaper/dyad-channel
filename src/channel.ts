@@ -343,7 +343,8 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 // Streaming: POST cumulative chunks during generation via onPartialReply (Tier 2),
                 // finalize via deliver (Tier 1). Same model as Telegram streaming.
                 const exchangeId = crypto.randomUUID();
-                let accumulated = "";
+                let accumulated = "";     // Full response text across all blocks
+                let blockPartial = "";    // Current block's cumulative text from onPartialReply
                 let buffer = "";
                 let sequence = 0;
                 let lastPostTime = Date.now();
@@ -375,28 +376,30 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   replyOptions: {
                     onPartialReply: async (payload: any) => {
                       // Tier 2: fires during token generation.
-                      // payload.text may be CUMULATIVE (full response so far) or INCREMENTAL
-                      // (new tokens only). Auto-detect by checking if payload starts with
-                      // the text we've already accumulated (prefix check, 64 char limit for perf).
+                      // payload.text is CUMULATIVE within each block but RESETS at block
+                      // boundaries. Track per-block cumulative separately from total accumulated.
                       if (!payload.text) return;
                       partialsReceived = true;
 
-                      const prevLen = accumulated.length;
-                      if (payload.text.length > prevLen) {
-                        // Payload is longer than accumulated — could be cumulative or a long token.
-                        // Check if it starts with our accumulated prefix to distinguish.
-                        const checkLen = Math.min(prevLen, 64);
-                        if (checkLen === 0 || payload.text.slice(0, checkLen) === accumulated.slice(0, checkLen)) {
-                          // Cumulative: extract only the new portion
-                          buffer += payload.text.slice(prevLen);
-                          accumulated = payload.text;
+                      const bpLen = blockPartial.length;
+                      if (payload.text.length >= bpLen && bpLen > 0) {
+                        // Same block, growing — check prefix to confirm cumulative
+                        const checkLen = Math.min(bpLen, 64);
+                        if (payload.text.slice(0, checkLen) === blockPartial.slice(0, checkLen)) {
+                          // Cumulative within same block: extract delta
+                          const delta = payload.text.slice(bpLen);
+                          blockPartial = payload.text;
+                          accumulated += delta;
+                          buffer += delta;
                         } else {
-                          // Long incremental token that doesn't match prefix
+                          // Different prefix — new block with longer initial text
+                          blockPartial = payload.text;
                           accumulated += payload.text;
                           buffer += payload.text;
                         }
                       } else {
-                        // Shorter than or equal to accumulated — incremental token
+                        // Shorter than current block or first call — new block started
+                        blockPartial = payload.text;
                         accumulated += payload.text;
                         buffer += payload.text;
                       }
