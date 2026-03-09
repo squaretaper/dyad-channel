@@ -347,8 +347,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 let blockPartial = "";    // Current block's cumulative text from onPartialReply
                 let buffer = "";
                 let sequence = 0;
-                let lastPostTime = Date.now();
+                let lastPostTime = 0;  // Set on first partial, not at init (model startup can take >5s)
                 let partialsReceived = false;
+                let posting = false;  // Lock to prevent concurrent postChunk calls
 
                 const postChunk = async (content: string, isFinal: boolean) => {
                   sequence++;
@@ -379,7 +380,10 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                       // payload.text is CUMULATIVE within each block but RESETS at block
                       // boundaries. Track per-block cumulative separately from total accumulated.
                       if (!payload.text) return;
-                      partialsReceived = true;
+                      if (!partialsReceived) {
+                        partialsReceived = true;
+                        lastPostTime = Date.now();  // Start timer from first token, not exchange init
+                      }
 
                       const bpLen = blockPartial.length;
                       if (payload.text.length >= bpLen && bpLen > 0) {
@@ -410,13 +414,16 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                         (buffer.length >= 100 && buffer.includes("\n\n")) ||
                         (buffer.length > 0 && Date.now() - lastPostTime >= 5000);
 
-                      if (shouldPost) {
+                      if (shouldPost && !posting) {
+                        posting = true;
                         try {
                           await postChunk(accumulated, false);
                           buffer = "";
                           lastPostTime = Date.now();
                         } catch (err: any) {
                           ctx.log?.error(`${tag} Streaming chunk POST failed: ${err.message}`);
+                        } finally {
+                          posting = false;
                         }
                       }
                     },
