@@ -347,6 +347,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                 let buffer = "";
                 let sequence = 0;
                 let lastPostTime = Date.now();
+                let partialsReceived = false;
 
                 const postChunk = async (content: string, isFinal: boolean) => {
                   sequence++;
@@ -358,10 +359,9 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   cfg: ctx.cfg,
                   dispatcherOptions: {
                     deliver: async (payload: any, _meta: any) => {
-                      // Tier 1: fires after generation completes with final block content.
-                      // If onPartialReply was active, it already accumulated all text —
-                      // deliver would duplicate it. Only accumulate if no partials arrived.
-                      if (payload.text && sequence === 0) {
+                      // Tier 1: fires after each block completes.
+                      // If onPartialReply was active, all text was already accumulated — skip.
+                      if (payload.text && !partialsReceived) {
                         accumulated += payload.text;
                       }
                     },
@@ -374,10 +374,32 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   },
                   replyOptions: {
                     onPartialReply: async (payload: any) => {
-                      // Tier 2: fires during token generation with incremental text.
+                      // Tier 2: fires during token generation.
+                      // payload.text may be CUMULATIVE (full response so far) or INCREMENTAL
+                      // (new tokens only). Auto-detect by checking if payload starts with
+                      // the text we've already accumulated (prefix check, 64 char limit for perf).
                       if (!payload.text) return;
-                      accumulated += payload.text;
-                      buffer += payload.text;
+                      partialsReceived = true;
+
+                      const prevLen = accumulated.length;
+                      if (payload.text.length > prevLen) {
+                        // Payload is longer than accumulated — could be cumulative or a long token.
+                        // Check if it starts with our accumulated prefix to distinguish.
+                        const checkLen = Math.min(prevLen, 64);
+                        if (checkLen === 0 || payload.text.slice(0, checkLen) === accumulated.slice(0, checkLen)) {
+                          // Cumulative: extract only the new portion
+                          buffer += payload.text.slice(prevLen);
+                          accumulated = payload.text;
+                        } else {
+                          // Long incremental token that doesn't match prefix
+                          accumulated += payload.text;
+                          buffer += payload.text;
+                        }
+                      } else {
+                        // Shorter than or equal to accumulated — incremental token
+                        accumulated += payload.text;
+                        buffer += payload.text;
+                      }
 
                       // POST at paragraph breaks (100+ chars), 500+ chars, or 5s since last POST
                       const shouldPost =
