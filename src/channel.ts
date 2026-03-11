@@ -4,7 +4,7 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
 import { DyadConfigSchema } from "./config-schema.js";
-import { startDyadBus, type DyadBusHandle, type TransportHealth } from "./supabase-bus.js";
+import { startDyadBus, CoalesceBuffer, type DyadBusHandle, type TransportHealth } from "./supabase-bus.js";
 import {
   listDyadAccountIds,
   resolveDefaultDyadAccountId,
@@ -341,21 +341,34 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   CommandAuthorized: false,
                 };
 
-                // Streaming: POST cumulative chunks during generation via onPartialReply (Tier 2),
-                // finalize via deliver (Tier 1). Same model as Telegram streaming.
+                // Streaming via CoalesceBuffer — active timer + size threshold.
+                // Replaces hand-rolled block-boundary heuristic that caused truncation.
                 const exchangeId = crypto.randomUUID();
-                accumulated = "";         // Reset for this exchange
-                let blockPartial = "";    // Current block's cumulative text from onPartialReply
-                let buffer = "";
+                accumulated = "";
+                let blockPartial = "";
                 let sequence = 0;
-                let lastPostTime = 0;  // Set on first partial, not at init (model startup can take >5s)
                 let partialsReceived = false;
-                let posting = false;  // Lock to prevent concurrent postChunk calls
 
                 const postChunk = async (content: string, isFinal: boolean) => {
                   sequence++;
                   await bus!.sendStreamingChunk(chatId, content, exchangeId, sequence, isFinal);
                 };
+
+                // CoalesceBuffer handles flush timing: 500+ chars OR 2s idle.
+                // On flush, POST cumulative content as a non-final streaming chunk.
+                const coalescer = new CoalesceBuffer(
+                  async (_flushedText: string) => {
+                    // _flushedText is the incremental buffer content — we ignore it
+                    // and POST the full accumulated text (cumulative delivery model).
+                    try {
+                      await postChunk(accumulated, false);
+                    } catch (err: any) {
+                      ctx.log?.error(`${tag} Streaming chunk POST failed: ${err.message}`);
+                    }
+                  },
+                  500,   // minChars: flush at 500+ chars buffered
+                  2000,  // idleMs: flush after 2s idle (active timer)
+                );
 
                 const result = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
                   ctx: msgCtx,
@@ -363,7 +376,7 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                   dispatcherOptions: {
                     deliver: async (payload: any, _meta: any) => {
                       // Tier 1: fires after each block completes.
-                      // If onPartialReply was active, all text was already accumulated — skip.
+                      // If onPartialReply was active, text was already accumulated — skip.
                       if (payload.text && !partialsReceived) {
                         accumulated += payload.text;
                       }
@@ -379,57 +392,35 @@ export const dyadPlugin: ChannelPlugin<ResolvedDyadAccount> = {
                     onPartialReply: async (payload: any) => {
                       // Tier 2: fires during token generation.
                       // payload.text is CUMULATIVE within each block but RESETS at block
-                      // boundaries. Track per-block cumulative separately from total accumulated.
+                      // boundaries. Extract delta and feed to CoalesceBuffer.
                       if (!payload.text) return;
-                      if (!partialsReceived) {
-                        partialsReceived = true;
-                        lastPostTime = Date.now();  // Start timer from first token, not exchange init
-                      }
+                      partialsReceived = true;
 
-                      const bpLen = blockPartial.length;
-                      if (payload.text.length >= bpLen && bpLen > 0) {
-                        // Same block, growing — check prefix to confirm cumulative
-                        const checkLen = Math.min(bpLen, 64);
-                        if (payload.text.slice(0, checkLen) === blockPartial.slice(0, checkLen)) {
-                          // Cumulative within same block: extract delta
-                          const delta = payload.text.slice(bpLen);
-                          blockPartial = payload.text;
-                          accumulated += delta;
-                          buffer += delta;
-                        } else {
-                          // Different prefix — new block with longer initial text
-                          blockPartial = payload.text;
-                          accumulated += payload.text;
-                          buffer += payload.text;
-                        }
+                      // Delta extraction: payload.text is cumulative within a block.
+                      // When a new block starts, payload.text resets (shorter or different prefix).
+                      let delta: string;
+                      if (blockPartial.length > 0 && payload.text.length > blockPartial.length &&
+                          payload.text.startsWith(blockPartial)) {
+                        // Same block, growing — extract only the new characters
+                        delta = payload.text.slice(blockPartial.length);
+                      } else if (blockPartial.length > 0 && payload.text === blockPartial) {
+                        // Duplicate callback — no new text
+                        return;
                       } else {
-                        // Shorter than current block or first call — new block started
-                        blockPartial = payload.text;
-                        accumulated += payload.text;
-                        buffer += payload.text;
+                        // New block (reset/shorter/different) — full text is new content
+                        delta = payload.text;
                       }
+                      blockPartial = payload.text;
+                      accumulated += delta;
 
-                      // POST at paragraph breaks (100+ chars), 500+ chars, or 5s since last POST
-                      const shouldPost =
-                        buffer.length >= 500 ||
-                        (buffer.length >= 100 && buffer.includes("\n\n")) ||
-                        (buffer.length > 0 && Date.now() - lastPostTime >= 5000);
-
-                      if (shouldPost && !posting) {
-                        posting = true;
-                        try {
-                          await postChunk(accumulated, false);
-                          buffer = "";
-                          lastPostTime = Date.now();
-                        } catch (err: any) {
-                          ctx.log?.error(`${tag} Streaming chunk POST failed: ${err.message}`);
-                        } finally {
-                          posting = false;
-                        }
-                      }
+                      // Feed delta to CoalesceBuffer — it handles flush timing
+                      coalescer.append(delta);
                     },
                   },
                 });
+
+                // Finalize: flush any remaining buffer, then POST final
+                await coalescer.finalize();
 
                 if (!result.queuedFinal) {
                   ctx.log?.warn(`${tag} No reply generated for chat ${chatId}`);
